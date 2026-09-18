@@ -109,9 +109,39 @@ Key decisions (detail below):
       stripped (top-level CMakeLists.txt:1551-1554 and galera cmake/compiler.cmake
       force it in non-debug builds — patch or override via CFLAGS), giving optimized
       code with live `assert()`.
-      **Important: stripping NDEBUG does NOT enable DBUG** — `DBUG_OFF` remains
+      ~~**Important: stripping NDEBUG does NOT enable DBUG** — `DBUG_OFF` remains
       defined in non-Debug builds, so DBUG keywords, DEBUG_SYNC, and the wsrep-lib SR
-      crash points stay unavailable on this tier.
+      crash points stay unavailable on this tier.~~
+      **CORRECTION (2026-09-11, verified during the first real build — see
+      `antithesis/VALIDATION.md`): the claim above is FALSE for 8.4.** There is no
+      separate `DBUG_OFF` in this tree; `include/my_dbug.h` gates the DBUG machinery
+      on `NDEBUG` directly (lines 40, 57, 298). So stripping NDEBUG *does* enable
+      DBUG, and the assert-enabled tier necessarily compiles `mysys/dbug.cc` in.
+      Getting this wrong is a link failure, not a silent difference:
+      `mysys/CMakeLists.txt:148` decides whether to compile `dbug.cc` by
+      string-matching the flags for `"DNDEBUG"` rather than testing the macro, so
+      `-DNDEBUG ... -UNDEBUG` drops `dbug.cc` while the headers still emit `_db_*`
+      calls. The harness therefore removes the `-DNDEBUG` prepend outright
+      (`antithesis/build/patch-sources.sh` patch 4).
+      **RESOLUTION (build-verified): this tier is built as `CMAKE_BUILD_TYPE=Debug`
+      with `-O2`, not as RelWithDebInfo-minus-NDEBUG.** The latter is not
+      constructible: `storage/heap/CMakeLists.txt:54` compiles `_check.cc` only when
+      `CMAKE_BUILD_TYPE_UPPER STREQUAL "DEBUG"`, which no compiler flag can satisfy,
+      and `storage/innobase/innodb.cmake:88` ties `-DUNIV_DEBUG` to the Debug flag
+      variable. See `antithesis/VALIDATION.md` finding 6 for the full table.
+      **So the v1 image also has DBUG, DEBUG_SYNC and UNIV_DEBUG live.** DEBUG_SYNC
+      in particular is therefore NOT Debug-tier-only as assumed above —
+      DEBUG_SYNC-based precondition manufacturing (donor-pause-mid-IST, joiner-stall
+      shapes) is reachable on the v1 tier. Sync points stay inert until set.
+      **This makes the tier heavier than planned: measure throughput, do not inherit
+      release-derived bounds.** If `-O2` proves unstable, `PXC_OPT_FLAGS="-g -O0"`
+      gives the vendor-exact Debug build.
+      Practical consequences for tier planning: this tier has a DBUG-capable binary
+      (runtime `--debug` keywords available, plus a per-traced-function branch on
+      `_db_enabled_()`), so **re-measure throughput before reusing any
+      release-derived timing bound** — the calibration note below applies here more
+      strongly than originally assumed. Whether the wsrep-lib SR crash points become
+      reachable on this tier is now an open question rather than a settled "no".
       Rationale for starting here: assertions are the densest free oracle in this SUT
       (the entire transaction/monitor/certification invariant surface is assert-only),
       and Antithesis's value is oracle density per CPU-hour.

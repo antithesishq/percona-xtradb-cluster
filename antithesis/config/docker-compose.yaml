@@ -1,0 +1,213 @@
+# Antithesis harness for Percona XtraDB Cluster 8.4.
+#
+# Topology (deployment-topology.md): three full mysqld nodes plus one workload
+# client. No proxy, no garbd, no async replica in v1.
+#
+#   pxc-workload ---3306--> pxc-node1 / pxc-node2 / pxc-node3
+#   nodes full-mesh on 4567 (gcomm), 4568 (IST), 4444 (SST)
+#
+# Direct per-node client connections are a feature, not an oversight: divergence
+# checks, ER 1047 non-primary assertions and stale-read properties all require
+# knowing exactly which node answered. A proxy would erase that.
+#
+# Build with `<engine> compose -f antithesis/config/docker-compose.yaml build`
+# from the repo root before launching. See antithesis/VALIDATION.md.
+
+name: pxc
+
+services:
+  # -------------------------------------------------------------------------
+  # pxc-node1 — the bootstrap node
+  # -------------------------------------------------------------------------
+  pxc-node1:
+    container_name: pxc-node1
+    hostname: pxc-node1
+    platform: linux/amd64
+    init: true
+    build:
+      context: ../..
+      dockerfile: antithesis/Dockerfile
+      target: pxc-node
+    image: pxc-node:latest
+    environment:
+      NO_COLOR: "1"
+      PXC_NODE_NAME: node1
+      PXC_NODE_ADDRESS: 10.20.20.11
+      # Only this node ever bootstraps, and the supervisor additionally guards
+      # it with an on-disk marker so a RESTART never re-bootstraps.
+      # Re-bootstrapping an already-formed cluster is the split-brain bug this
+      # harness exists to find; the harness must not cause it by accident.
+      PXC_BOOTSTRAP: "1"
+    networks:
+      pxc-net:
+        ipv4_address: 10.20.20.11
+    # mysqld's SIGTERM handler sleeps pxc_maint_transition_period (10s default)
+    # before it even starts shutting down. Docker's default 10s grace would
+    # therefore SIGKILL at the start of every graceful stop, guaranteeing an
+    # unclean shutdown, grastate seqno -1, and a forced SST on the way back.
+    # We keep the variable at its field default and fix the harness side here.
+    stop_grace_period: 90s
+    # gu_abort()'s in-process core suppression is patched out of this image, so
+    # lift the container limit too and let Antithesis collect the cores.
+    ulimits:
+      core:
+        soft: -1
+        hard: -1
+    healthcheck:
+      # wsrep_local_state = 4 is Synced. Deliberately NOT clustercheck.sh:
+      # it returns 200 without validating the ability to commit, and its
+      # accuracy is a property under test rather than a harness dependency.
+      test:
+        - CMD-SHELL
+        - >-
+          /usr/local/pxc/bin/mysql -uroot --protocol=socket
+          --socket=/var/lib/mysql/mysql.sock -N -B
+          -e "SELECT VARIABLE_VALUE FROM performance_schema.global_status
+              WHERE VARIABLE_NAME='wsrep_local_state'" 2>/dev/null | grep -qx 4
+      interval: 5s
+      timeout: 10s
+      retries: 60
+      # First boot has to initialize the datadir before mysqld even starts.
+      start_period: 300s
+
+  # -------------------------------------------------------------------------
+  # pxc-node2 — joins node1
+  # -------------------------------------------------------------------------
+  pxc-node2:
+    container_name: pxc-node2
+    hostname: pxc-node2
+    platform: linux/amd64
+    init: true
+    build:
+      context: ../..
+      dockerfile: antithesis/Dockerfile
+      target: pxc-node
+    image: pxc-node:latest
+    environment:
+      NO_COLOR: "1"
+      PXC_NODE_NAME: node2
+      PXC_NODE_ADDRESS: 10.20.20.12
+      PXC_BOOTSTRAP: "0"
+    networks:
+      pxc-net:
+        ipv4_address: 10.20.20.12
+    stop_grace_period: 90s
+    ulimits:
+      core:
+        soft: -1
+        hard: -1
+    depends_on:
+      # service_healthy, not plain depends_on: a started container is not a
+      # Synced node, and a joiner that races the bootstrap has no donor.
+      pxc-node1:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          /usr/local/pxc/bin/mysql -uroot --protocol=socket
+          --socket=/var/lib/mysql/mysql.sock -N -B
+          -e "SELECT VARIABLE_VALUE FROM performance_schema.global_status
+              WHERE VARIABLE_NAME='wsrep_local_state'" 2>/dev/null | grep -qx 4
+      interval: 5s
+      timeout: 10s
+      retries: 60
+      # Joining means a full SST from node1, which is slower than a bootstrap.
+      start_period: 420s
+
+  # -------------------------------------------------------------------------
+  # pxc-node3 — joins after node2 is Synced
+  # -------------------------------------------------------------------------
+  pxc-node3:
+    container_name: pxc-node3
+    hostname: pxc-node3
+    platform: linux/amd64
+    init: true
+    build:
+      context: ../..
+      dockerfile: antithesis/Dockerfile
+      target: pxc-node
+    image: pxc-node:latest
+    environment:
+      NO_COLOR: "1"
+      PXC_NODE_NAME: node3
+      PXC_NODE_ADDRESS: 10.20.20.13
+      PXC_BOOTSTRAP: "0"
+    networks:
+      pxc-net:
+        ipv4_address: 10.20.20.13
+    stop_grace_period: 90s
+    ulimits:
+      core:
+        soft: -1
+        hard: -1
+    depends_on:
+      # Chained behind node2 on purpose: two joiners requesting SST from the
+      # same donor simultaneously is a real scenario, but it belongs in the
+      # workload where it can be observed, not in every single startup.
+      pxc-node2:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          /usr/local/pxc/bin/mysql -uroot --protocol=socket
+          --socket=/var/lib/mysql/mysql.sock -N -B
+          -e "SELECT VARIABLE_VALUE FROM performance_schema.global_status
+              WHERE VARIABLE_NAME='wsrep_local_state'" 2>/dev/null | grep -qx 4
+      interval: 5s
+      timeout: 10s
+      retries: 60
+      start_period: 420s
+
+  # -------------------------------------------------------------------------
+  # pxc-workload — test driver; emits setup_complete
+  # -------------------------------------------------------------------------
+  pxc-workload:
+    container_name: pxc-workload
+    hostname: pxc-workload
+    platform: linux/amd64
+    init: true
+    build:
+      context: ../..
+      dockerfile: antithesis/Dockerfile
+      target: workload
+    image: pxc-workload:latest
+    environment:
+      NO_COLOR: "1"
+      PYTHONUNBUFFERED: "1"
+      PXC_NODE1_HOST: 10.20.20.11
+      PXC_NODE2_HOST: 10.20.20.12
+      PXC_NODE3_HOST: 10.20.20.13
+      PXC_CLUSTER_SIZE: "3"
+    networks:
+      pxc-net:
+        ipv4_address: 10.20.20.20
+    depends_on:
+      pxc-node1:
+        condition: service_healthy
+      pxc-node2:
+        condition: service_healthy
+      pxc-node3:
+        condition: service_healthy
+
+# ---------------------------------------------------------------------------
+# Network
+#
+# Static IPs, not DNS names. gcomm resolves peer addresses exactly once at
+# connect() and then retries the stale IP forever (sut-analysis §8.3). With
+# Antithesis restarting containers, dynamic addressing would turn every restart
+# scenario into the same DNS finding and drown out everything else. Static
+# addressing makes that behavior a deliberately-chosen later target instead of
+# ambient noise.
+#
+# Note: `internal: true` is deliberately NOT set — it would cut the containers
+# off from the Antithesis network.
+# ---------------------------------------------------------------------------
+networks:
+  pxc-net:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 10.20.20.0/24

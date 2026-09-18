@@ -1,0 +1,37 @@
+# Build context for antithesis/Dockerfile is this directory (the repo root),
+# because the pxc-node image builds PXC from source.
+#
+# Keep exclusions minimal — anything removed here that the build needs fails
+# deep inside a long cmake run. Only genuinely build-irrelevant things go below.
+
+# Version control metadata. No build step needs it: the galera version is
+# parsed from GALERA_VERSION, and the one place cmake shells out to git
+# (storage/rocksdb, for version stamping) is guarded by an EXISTS check on a
+# .git that is not present anyway.
+#
+# `**/.git` matters as well as `.git`: submodule .git entries are *files*
+# holding "gitdir: ../.git/modules/...", which would point at the excluded
+# top-level .git and dangle inside the image. Excluding them keeps any stray
+# git invocation failing cleanly with "not a repository" instead of chasing a
+# broken pointer.
+.git
+.git/**
+**/.git
+.hg
+.hg/**
+
+# Local build output, if anyone has built in-tree.
+/build
+/bld
+CMakeCache.txt
+CMakeFiles/
+
+# Editor and OS noise.
+*.swp
+*.swo
+.DS_Store
+
+# Python bytecode — would otherwise be copied into the workload image and into
+# /opt/antithesis/catalog/, which Antithesis scans for assertions.
+**/__pycache__
+**/*.pyc

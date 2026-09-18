@@ -1,0 +1,8 @@
+# Antithesis Python SDK — assertions, lifecycle (setup_complete), randomness.
+# Pinned so the assertion catalog is reproducible across rebuilds.
+antithesis==0.3.1
+
+# Pure-Python MySQL driver. Chosen over mysqlclient deliberately: it needs no
+# libmysqlclient headers or C toolchain in the runtime image, which keeps the
+# workload image small and its build independent of the server build.
+PyMySQL==1.1.1
