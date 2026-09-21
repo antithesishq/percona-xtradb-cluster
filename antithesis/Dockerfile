@@ -210,6 +210,17 @@ RUN set -eux; \
 # ---------------------------------------------------------------------------
 # Build 2 of 2: the PXC server, via cmake.
 #
+# `make -j$JOBS -k`, NOT fail-fast plus a serial retry. An earlier version of
+# this file re-ran `make -j1` on failure to get an attributable error. Measured
+# on a real failure that cost 91% of the wall clock for nothing:
+#     parallel -j20 : 4.3 min, reached 61%, printed a complete error
+#     serial   -j1  : 45.8 min, re-did the same work, reached the same 61%
+# --output-sync=target already keeps each target's diagnostics contiguous, so
+# the parallel error was fully readable on its own. `-k` then adds what the
+# retry was really for: it continues into independent targets instead of
+# stopping at the first failure, so ONE parallel pass reports every independent
+# error. Strictly more information, roughly an eighth of the time.
+#
 # INSTALL_MYSQLTESTDIR is set empty so `make install` skips the mysql-test
 # suite — it is hundreds of megabytes that the runtime image has no use for.
 # Run MTR from a build tree, not from this image.
@@ -220,6 +231,35 @@ RUN set -eux; \
 # chunk of build time and, incidentally, one of the two files that failed on
 # the ENABLED_DEBUG_SYNC issue above (storage/ndb/plugin/ha_ndbcluster_binlog.cc
 # calls debug_sync_set_action from inside DBUG_EXECUTE_IF).
+#
+# MYSQL_MAINTAINER_MODE=OFF is REQUIRED for the Debug-at-O2 tier, and is the
+# other half of the "not a vendor-tested combination" caveat coming due.
+#
+# CMakeLists.txt:660-666 turns maintainer mode ON automatically for
+# `CMAKE_BUILD_TYPE=Debug` + GCC, and cmake/maintainer.cmake:236 makes that
+# mean exactly one thing: `-Werror`. Nothing else is gated on it — the warning
+# flags themselves are set unconditionally outside that block — so switching it
+# off is surgical.
+#
+# Why it matters here: GCC's interprocedural warnings depend on optimization.
+#   vendor Debug      -O0 + -Werror  -> warnings never fire, build is clean
+#   vendor RelWithDeb -O2, no -Werror -> warnings fire but are not fatal
+#   this tier         -O2 + -Werror  -> worst of both, build dies
+#
+# It killed two files, both known-benign GCC false positives that only appear
+# once inlining happens:
+#   utilities/innochecksum.cc  -Werror=array-bounds on Prealloced_array<byte,1>
+#   sql/mysqld.cc:8022         -Werror=stringop-truncation on
+#                              strncpy(server_uuid, uuid.c_ptr(), sizeof(...))
+#                              — server_uuid is char[37], the UUID is 36 chars,
+#                              so it fits and is NUL-terminated; GCC just cannot
+#                              prove the source length.
+#
+# Disabling -Werror fixes the whole class at once rather than chasing
+# -Wno-error= flags one ~50-minute build at a time. The warnings still print.
+# We are not MySQL maintainers, and we deliberately chose a non-vendor
+# optimization level, so treating their maintainer warnings as build-fatal is
+# not our call to inherit.
 #
 # WITH_AUTHENTICATION_LDAP is a strictness flag, not a feature switch — cmake
 # documents it as "Report error if the LDAP authentication plugin cannot be
@@ -336,16 +376,17 @@ RUN set -eux; \
         -DWITH_NDB=OFF \
         -DWITH_PAM=ON \
         -DWITH_AUTHENTICATION_LDAP=OFF \
+        -DMYSQL_MAINTAINER_MODE=OFF \
         -DINSTALL_MYSQLTESTDIR= \
         -DFORCE_INSOURCE_BUILD=0 ; \
-    if ! make -j"$JOBS" --output-sync=target; then \
+    if ! make -j"$JOBS" -k --output-sync=target; then \
         echo "=================================================================="; \
-        echo "ANTITHESIS: parallel build failed. Re-running serially to surface"; \
-        echo "the actual failing target — with -j${JOBS} the real error is"; \
-        echo "interleaved with other targets and the top-level 'Error 2' says"; \
-        echo "nothing. This is incremental, so it stops at the true failure."; \
+        echo "ANTITHESIS: build failed. Every failing target is reported above,"; \
+        echo "each with contiguous output (--output-sync=target) and none"; \
+        echo "suppressed (-k keeps going past the first error into independent"; \
+        echo "targets). Find them with:"; \
+        echo "    grep -nE 'error:|undefined reference|Error [0-9]' <log>"; \
         echo "=================================================================="; \
-        make -j1 --output-sync=target; \
         exit 1; \
     fi; \
     make install

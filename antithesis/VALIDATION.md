@@ -259,6 +259,36 @@ engine with no relationship to galera replication; PXC uses InnoDB and nothing
 in the property catalog touches NDB. It was building by default, costing
 substantial time.
 
+**8. `MYSQL_MAINTAINER_MODE=OFF` — the other half of the Debug-at-`-O2`
+caveat.** `CMakeLists.txt:660-666` turns maintainer mode ON automatically for
+`CMAKE_BUILD_TYPE=Debug` + GCC, and `cmake/maintainer.cmake:236` makes that
+mean exactly one thing: `-Werror`. Nothing else is gated on it.
+
+GCC's interprocedural warnings depend on optimization, so the three
+configurations diverge:
+
+| Config | Flags | Result |
+|---|---|---|
+| vendor Debug | `-O0` + `-Werror` | warnings never fire — clean |
+| vendor RelWithDebInfo | `-O2`, no `-Werror` | warnings fire, not fatal |
+| **this tier** | `-O2` + `-Werror` | **worst of both — build dies** |
+
+Two files died, both known-benign GCC false positives that only appear once
+inlining happens:
+
+- `utilities/innochecksum.cc` — `-Werror=array-bounds` on
+  `Prealloced_array<byte, 1>`, via `mach_read_from_2` inlined into `main`.
+- `sql/mysqld.cc:8022` — `-Werror=stringop-truncation` on
+  `strncpy(server_uuid, uuid.c_ptr(), sizeof(server_uuid))`. `server_uuid` is
+  `char[37]` and a UUID is 36 chars, so it fits and *is* NUL-terminated; GCC
+  simply cannot prove the source length.
+
+Disabling `-Werror` fixes the whole class at once instead of chasing
+`-Wno-error=` flags one ~50-minute build at a time. Warnings still print. We
+are not MySQL maintainers, and we deliberately chose a non-vendor optimization
+level, so treating their maintainer warnings as build-fatal is not ours to
+inherit.
+
 **A reporting fix, not a build fix:** `make -j20` interleaves output, so a
 failing target's error scrolls away and the top-level `make: *** [Makefile:166:
 all] Error 2` says nothing about what broke. The build now runs with
