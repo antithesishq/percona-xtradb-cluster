@@ -102,15 +102,32 @@ WSREP_STATUS_NAMES = [
 ]
 
 
+# Why each host last failed, keyed by host. Without this, the bare
+# `except Exception` below reports every failure as the single word
+# "unreachable", which reads like a network fault. It once hid a
+# RuntimeError raised by PyMySQL's caching_sha2_password path (the
+# `cryptography` package was missing from requirements.txt) and sent
+# debugging toward the network for a full validate cycle. Keep the reason.
+LAST_ERROR: dict[str, str] = {}
+
+
 def node_state(host: str) -> dict[str, str] | None:
-    """Return the wsrep status of one node, or None if it is unreachable."""
+    """Return the wsrep status of one node, or None if it is unreachable.
+
+    On failure the reason is recorded in LAST_ERROR[host] so the readiness
+    report can name it rather than just saying "unreachable".
+    """
     try:
         conn = connect(host)
-    except Exception:
+    except Exception as exc:
+        LAST_ERROR[host] = f"{type(exc).__name__}: {exc}"
         return None
     try:
-        return status_vars(conn, WSREP_STATUS_NAMES)
-    except Exception:
+        state = status_vars(conn, WSREP_STATUS_NAMES)
+        LAST_ERROR.pop(host, None)
+        return state
+    except Exception as exc:
+        LAST_ERROR[host] = f"{type(exc).__name__}: {exc}"
         return None
     finally:
         try:
@@ -168,13 +185,13 @@ def wait_for_cluster() -> dict[str, dict[str, str]]:
             summary = ", ".join(
                 f"{name}="
                 + (
-                    "unreachable"
+                    "unreachable (" + LAST_ERROR.get(host, "no detail") + ")"
                     if states[name] is None
                     else f"state{states[name].get('wsrep_local_state', '?')}"
                     f"/{states[name].get('wsrep_cluster_status', '?')}"
                     f"/size{states[name].get('wsrep_cluster_size', '?')}"
                 )
-                for name, _ in NODES
+                for name, host in NODES
             )
             log(f"waiting for cluster: {summary}; distinct state UUIDs={len(uuids)}")
 

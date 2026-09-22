@@ -12,6 +12,30 @@
 # decision record and antithesis/VALIDATION.md for how to build and validate.
 
 # ---------------------------------------------------------------------------
+# Stage: pxc-src — the PXC source tree with the harness directory removed.
+#
+# The build context is the whole repo, so a plain `COPY . /src` into pxc-build
+# would place antithesis/ inside the compile stage. Every harness edit — one
+# line in the workload driver, a tweak to the supervisor — would then change
+# that layer's checksum and invalidate the ENTIRE galera + server compile,
+# costing ~25 minutes for a change that cannot affect a single object file.
+# That happened three times before this stage existed.
+#
+# Stripping antithesis/ here makes the tree handed to pxc-build depend only on
+# real PXC sources. BuildKit keys `COPY --from` on the CONTENT of what it
+# copies, so a harness-only edit re-runs this stage (a file copy, no compile),
+# produces a byte-identical /src, and the compile below stays cached.
+#
+# The harness files the build genuinely DOES need (antithesis/build/) are
+# copied into pxc-build separately, so editing those still correctly forces a
+# rebuild — they change the sources that get compiled.
+# ---------------------------------------------------------------------------
+FROM debian:bookworm-slim AS pxc-src
+
+COPY . /src
+RUN rm -rf /src/antithesis
+
+# ---------------------------------------------------------------------------
 # Stage: pxc-build
 # ---------------------------------------------------------------------------
 FROM debian:bookworm AS pxc-build
@@ -84,7 +108,14 @@ RUN if [ "$PXC_INSTRUMENT" = "1" ]; then \
     fi
 
 WORKDIR /src
-COPY . /src
+
+# Source tree only — see the pxc-src stage above for why this is not `COPY .`.
+COPY --from=pxc-src /src /src
+
+# Build-time harness scripts, kept OUT of /src so they are not part of the
+# source checksum. Editing these does invalidate the compile below, which is
+# correct: they rewrite the sources that get compiled.
+COPY antithesis/build/ /opt/antithesis/build/
 
 # ---------------------------------------------------------------------------
 # Source patches, applied before either build.
@@ -100,7 +131,7 @@ COPY . /src
 # an upstream rename surfaces here rather than as a silent no-op that quietly
 # removes an oracle. See antithesis/build/patch-sources.sh.
 # ---------------------------------------------------------------------------
-RUN PXC_INSTRUMENT="$PXC_INSTRUMENT" bash /src/antithesis/build/patch-sources.sh /src
+RUN PXC_INSTRUMENT="$PXC_INSTRUMENT" bash /opt/antithesis/build/patch-sources.sh /src
 
 # ---------------------------------------------------------------------------
 # Build 1 of 2: the galera provider, via scons.
@@ -449,27 +480,51 @@ RUN set -eux; \
     fi
 
 # ---------------------------------------------------------------------------
-# Percona XtraBackup 8.4, required by wsrep_sst_method=xtrabackup-v2.
+# Percona XtraBackup, required by wsrep_sst_method=xtrabackup-v2.
 #
-# wsrep_sst_xtrabackup-v2.sh resolves PXB relative to its own location:
-# "$(dirname $0)/pxc_extra/pxb-8.4/bin/xtrabackup", and enforces a minimum
-# version of 8.4.0-5. The 8.3 / 8.0 sibling paths are only consulted for
-# cross-version donors, which a homogeneous 8.4 cluster never has, so only
-# pxb-8.4 is installed. Add the others if a rolling-upgrade variant lands.
+# wsrep_sst_xtrabackup-v2.sh verifies TWO PXB installs unconditionally, at
+# script start, before it even inspects the joiner/donor role
+# (scripts/wsrep_sst_xtrabackup-v2.sh:1789 and :1794):
+#
+#     verify_pxb_version ".../pxc_extra/pxb-8.4"   >= 8.4.0-5
+#     verify_pxb_version ".../pxc_extra/pxb-8.0"   >= 8.0.35
+#
+# The pxb-8.3 check on the line between them is commented out upstream.
+#
+# pxb-8.0 is therefore NOT optional, even for a homogeneous 8.4 cluster that
+# will never have a cross-version donor. Omitting it makes every SST die with
+# "Could not find the xtrabackup executable", which presents as a joiner that
+# bootstraps, joins the group, requests state transfer, and then aborts --
+# i.e. a cluster that never reaches wsrep_local_state=4 on nodes 2 and 3.
+#
+# Percona's own packaging ships both (build-ps/build-binary.sh:717-726) and
+# pins the 8.0 series at 8.0.35-36 (build-ps/pxc_builder.sh:553).
+#
+# verify_pxb_version does not merely stat the binary: it runs `--version` and
+# parses the output. A binary that is present but cannot execute would pass a
+# `test -x` here and still fail at SST time, so the executability check lives
+# in the pxc-node stage, against the image that actually runs it.
 # ---------------------------------------------------------------------------
-ARG PXB_VERSION=8.4.0-5
+ARG PXB84_VERSION=8.4.0-5
+ARG PXB80_VERSION=8.0.35-36
 ARG PXB_GLIBC=2.35
 
 RUN set -eux; \
-    PXB_TARBALL="percona-xtrabackup-${PXB_VERSION}-Linux-x86_64.glibc${PXB_GLIBC}.tar.gz"; \
-    curl -fsSL -o /tmp/pxb.tar.gz \
-        "https://downloads.percona.com/downloads/Percona-XtraBackup-8.4/Percona-XtraBackup-${PXB_VERSION}/binary/tarball/${PXB_TARBALL}"; \
-    mkdir -p /tmp/pxb "${PXC_PREFIX}/bin/pxc_extra/pxb-8.4"; \
-    tar -xzf /tmp/pxb.tar.gz -C /tmp/pxb --strip-components=1; \
-    cp -r /tmp/pxb/bin "${PXC_PREFIX}/bin/pxc_extra/pxb-8.4/"; \
-    cp -r /tmp/pxb/lib "${PXC_PREFIX}/bin/pxc_extra/pxb-8.4/"; \
-    rm -rf /tmp/pxb /tmp/pxb.tar.gz; \
-    test -x "${PXC_PREFIX}/bin/pxc_extra/pxb-8.4/bin/xtrabackup"
+    install_pxb() { \
+        series="$1"; version="$2"; \
+        tarball="percona-xtrabackup-${version}-Linux-x86_64.glibc${PXB_GLIBC}.tar.gz"; \
+        dest="${PXC_PREFIX}/bin/pxc_extra/pxb-${series}"; \
+        curl -fsSL -o /tmp/pxb.tar.gz \
+            "https://downloads.percona.com/downloads/Percona-XtraBackup-${series}/Percona-XtraBackup-${version}/binary/tarball/${tarball}"; \
+        mkdir -p /tmp/pxb "${dest}"; \
+        tar -xzf /tmp/pxb.tar.gz -C /tmp/pxb --strip-components=1; \
+        cp -r /tmp/pxb/bin "${dest}/"; \
+        cp -r /tmp/pxb/lib "${dest}/"; \
+        rm -rf /tmp/pxb /tmp/pxb.tar.gz; \
+        test -x "${dest}/bin/xtrabackup"; \
+    }; \
+    install_pxb 8.4 "${PXB84_VERSION}"; \
+    install_pxb 8.0 "${PXB80_VERSION}"
 
 # ---------------------------------------------------------------------------
 # Stage: pxc-node — runtime image for pxc-node1/2/3
@@ -528,6 +583,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN groupadd -r mysql && useradd -r -g mysql -d /var/lib/mysql -s /sbin/nologin mysql
 
 COPY --from=pxc-build ${PXC_PREFIX} ${PXC_PREFIX}
+
+# Verify both PXB installs the way the SST script will. verify_pxb_version()
+# runs `xtrabackup --version` and parses the output, so a binary that is
+# present but cannot execute in THIS image -- missing runtime library, wrong
+# glibc build -- passes the build stage's `test -x` and only fails later, at
+# SST time, as an unrecoverable joiner abort. Catch it here instead.
+RUN set -eux; \
+    for series in 8.4 8.0; do \
+        xb="${PXC_PREFIX}/bin/pxc_extra/pxb-${series}/bin/xtrabackup"; \
+        test -x "$xb"; \
+        "$xb" --version 2>&1 | grep -qE '[0-9]+\.[0-9]+\.[0-9]+'; \
+    done
 
 # Symbolization. The binaries are built with -g and --build-id and are NOT
 # stripped, so a one-hop symlink into /symbols is all Antithesis needs.

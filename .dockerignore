@@ -35,3 +35,15 @@ CMakeFiles/
 # /opt/antithesis/catalog/, which Antithesis scans for assertions.
 **/__pycache__
 **/*.pyc
+
+# Build logs. These live in the repo root and change on EVERY build, so without
+# this they alter the `COPY . /src` layer checksum and invalidate the entire
+# compile cache — galera and the full cmake build would re-run every time even
+# when no source changed.
+*.log
+**/*.log
+
+# This file itself. It sits at the context root, OUTSIDE antithesis/, so the
+# pxc-src stage would otherwise carry it into /src and every edit here would
+# invalidate the entire compile — the exact problem pxc-src exists to prevent.
+.dockerignore

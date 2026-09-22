@@ -6,3 +6,14 @@ antithesis==0.3.1
 # libmysqlclient headers or C toolchain in the runtime image, which keeps the
 # workload image small and its build independent of the server build.
 PyMySQL==1.1.1
+
+# Required by PyMySQL for caching_sha2_password, which is the DEFAULT (and, in
+# 8.4, effectively the only) authentication plugin for new users. On the first
+# connection the server's password cache is empty, so auth takes the "full
+# auth" path; over a plain TCP connection that path RSA-encrypts the password
+# with the server's public key, and PyMySQL raises
+#     RuntimeError: 'cryptography' package is required for sha256_password or
+#                   caching_sha2_password auth methods
+# without this. PyMySQL declares it only as an optional extra, so it must be
+# named explicitly. Symptom if missing: every node reports "unreachable".
+cryptography==43.0.1
