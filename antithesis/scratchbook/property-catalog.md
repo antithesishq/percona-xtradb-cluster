@@ -1,7 +1,7 @@
 ---
 sut_path: /home/colaya/src/customer/customer-percona/percona-xtradb-cluster
-commit: f9ecb3ebe8ff4df5e9b931becea4f9bb640d79ae
-updated: 2026-09-10
+commit: f742d6a2dbc98b29ee501832930872e59e2da4e7
+updated: 2026-09-22
 external_references:
   - path: https://docs.percona.com/percona-xtradb-cluster/8.4/
     why: Upstream product documentation (user-approved scope: repo + upstream docs)
@@ -84,6 +84,109 @@ adding it costs a comparison, not an eleventh implementation effort.
 channel is proven — NOT deleted):** `acked-commit-durable-across-restart` (dead without
 ungraceful termination), `grastate-se-checkpoint-agreement` (near-vacuous under
 graceful-only restarts — both branches trivially agree).
+
+## Implementation status (antithesis-workload, 2026-09-22)
+
+One general-purpose test template, `pxc`, now exists at `antithesis/test/pxc/`, with all
+logic and every SDK assertion in `antithesis/workload/pxcwl/`. The design is deliberately
+**not** one template or one test case per property: broad swarm-parameterised traffic drives
+the system, fault injection forces the interesting states, and catalog properties are
+expressed as assertions layered over that one traffic stream. Per-property targeting is
+deferred until triage shows the broad workload is missing something.
+
+35 assertions are cataloged (including the pre-existing bootstrap `reachable`): 16 `always`,
+5 `always_or_unreachable`, 13 `reachable` and 1 `unreachable`. The 13 reach claims exist to
+prove the workload gets where it should. **Unfired reach claims after the first run are the
+iteration list.**
+
+Two of those came out of a fresh-context review that found real coverage holes: nothing had
+compared the *results* of DDL across nodes (every DDL target is a scratch table outside the
+checksum set, and a missing table scored as identical), and the cross-node causality claim
+in `sync_wait_read` was computed and discarded. Both are now asserted — see
+`../VALIDATION.md` for the full review findings, including a severe missing-`ROLLBACK` bug
+that would have fired the no-trace assertion on a correct cluster.
+
+### Commands
+
+| Command | Role |
+| --- | --- |
+| `first_seed_workload_schema` | Draws the timeline's swarm profile once, creates the schema, applies server posture |
+| `parallel_driver_traffic` | The traffic generator: 7 action classes plus 10 admin levers |
+| `anytime_cluster_probe` | Continuous checks of what each node claims against what it does |
+| `eventually_verify_convergence` | Terminal oracle with faults stopped, drivers killed |
+| `finally_verify_convergence` | Terminal oracle on timelines where every command completed |
+
+### Covered — detected by the terminal oracle
+
+The checksum and GTID comparison pass is the terminal oracle these reduce to
+(see `property-relationships.md`). All are now **covered**:
+
+`cross-node-row-equality`, `gtid-executed-cluster-convergence`,
+`bf-bf-lock-suppression-no-divergence`, `ist-overlap-writesets-not-reapplied`,
+`sr-fragment-cross-node-agreement`, `sr-rollback-fragment-noop`,
+`autoinc-identity-no-cross-node-collision`, `privilege-context-divergence-never-evicts`,
+`applier-threads-never-read-only`, `cert-interval-reject-symmetry` (as a standing check
+rather than the reframed calibration).
+
+### Covered — detected by the shared ack journal
+
+The journal records every write as ATTEMPTED before issue, then resolves it to ACKED,
+FAILED (clean rejection, node alive, provably no trace) or UNKNOWN (connection died;
+outcome unknowable). Acked writes must be present, cleanly-failed writes must be absent,
+and unknown writes get no verdict — which is what makes the check sound under faults.
+
+`non-primary-rejects-writes`, `first-committer-wins-loser-leaves-no-trace`,
+`retry-autocommit-exactly-once`, `bf-replay-commits-exactly-once`,
+`sync-wait-reads-observe-acked-writes`, `acked-commit-durable-across-restart`
+(**graceful-restart form only** — see gaps below).
+
+### Covered — reconvergence, lineage, and continuous checks
+
+`partition-heal-single-primary-remerge`, `restarted-node-rejoins-synced`,
+`joiner-reaches-synced-after-state-transfer`, `donor-returns-to-synced`,
+`failed-state-transfer-node-rejoins`, `full-cluster-restart-reaches-primary`,
+`at-most-one-primary-component`, `cluster-identity-single-lineage`,
+`no-dual-bootstrap-after-full-shutdown` (runtime form), `cluster-address-live-set-rejoins`,
+`flow-control-pause-releases`, `synced-node-recv-queue-bounded`,
+`commit-order-monitor-released-no-cluster-stall`, `local-monitor-freed-after-bf-abort`,
+`monitor-window-overflow-unreachable` (as symptom),
+`clustercheck-200-implies-write-progress`, `maint-mode-honors-operator-intent`
+(**pre-registered KNOWN-RED**), `skip-locked-nowait-never-fatal`,
+`applier-resize-converges`, `toi-nbo-ddl-completes-or-fails-cleanly` (TOI half),
+`graceful-shutdown-bounded`, `desync-ftwrl-composition-resyncs` (desync and instance
+backup-lock legs; FTWRL itself is blocked by `pxc_strict_mode=ENFORCING`).
+
+### Covered by the build, not by an assertion
+
+The images are an assert-enabled source build, so every native Galera/InnoDB assertion is
+already an oracle and the workload's job is only to *reach* it: `no-mdl-bf-bf-abort`,
+`trx-replay-never-fatal`, `illegal-wsrep-transition-never-taken`,
+`gcs-total-order-gap-free`, `fatal-node-terminates-no-zombie`.
+
+### Not covered, and why
+
+| Not covered | Reason |
+| --- | --- |
+| The 11 `+kill` crash-recovery properties — `grastate-se-checkpoint-agreement`, `wsrep-xid-checkpoint-monotonic`, `interrupted-sst-forces-full-sst`, `gcache-crash-recovery-no-abort`, `gcache-recovered-ist-completeness`, `sst-grant-all-user-locked-or-absent`, `crash-recovery-grep-yields-true-position`, `gcache-page-files-bounded` (orphan half), and the ungraceful half of `acked-commit-durable-across-restart` | The supervisor's kill channel is a control file under `$PXC_STATE_DIR` on the **node** containers, and `config/docker-compose.yaml` declares no volumes, so the workload container has no filesystem path to it. The only node-down mechanisms available are SQL `SHUTDOWN` (graceful) and `gmcast.isolate` (logical). Unlocking this needs either platform container-kill faults or a per-node volume — an environment change, not a template change. |
+| `notify-cmd-hang-does-not-block-commits`, `async-monitor-leave-mismatch-unreachable` | `wsrep_notify_cmd` is `READ_ONLY`; needs a my.cnf variant image. |
+| `duplicate-gtid-skip-exactly-once` | Needs an async source topology, still an open catalog decision. |
+| `inconsistency-vote-evicts-divergent-minority`, `evicted-node-rejoins-only-via-sst`, `cluster-member-strings-never-reach-shell` | Sabotage variants. Deliberate divergence injection would make the unconditional checksum `Always` permanently red in this shared environment; the poison-budget convention fences them into their own variant. |
+| `bf-abort-skip-awake-victim-already-killed`, `commit-cut-bounded-by-delivered-seqno`, `vote-message-payload-contract`, `homogeneous-cert-version-match`, `no-spurious-multi-major-detection`, `rolling-upgrade-write-gate` | `v2-instrumented` / release-image work. `PXC_INSTRUMENT=0`, so there is no coverage-guided search and no thread-pausing faults. |
+| `nonready-node-error-code-contract` | Known-red on a verified defect (unready TOI returns ER 1213, not 1047). Arming it buys a permanent red and no information; the workload tallies errno-per-shape as data instead, and a reach claim proves the 1047 path fires. |
+| PK-less divergence at full strength | `pxc_strict_mode=ENFORCING` blocks PK-less DML. The workload opens a fenced PERMISSIVE window and compares `wl_nopk` under its **own** property name, so a red on this documented limitation cannot mask a red on the real content invariant. |
+
+### Calibration values needing a first measurement
+
+Every one of these is deliberately loose: a tight bound that fires on legitimate slow
+recovery is worse than a loose one that still catches a true wedge. All live in
+`workload/pxcwl/config.py` and are env-overridable.
+
+| Value | Default | What sets it |
+| --- | --- | --- |
+| `PXC_GREEN_WINDOW` | 120s | Sustained clustercheck-green window that must contain a commit |
+| `PXC_WEDGE_WINDOW` | 300s | Commit-progress freeze while all nodes claim health |
+| `PXC_SHUTDOWN_BOUND` | 120s | SQL `SHUTDOWN` to port-closed |
+| `PXC_RECV_QUEUE_SLACK` | 100x `fc_limit` | Recv-queue ceiling on a Synced, non-desynced node |
 
 ## Assumptions
 

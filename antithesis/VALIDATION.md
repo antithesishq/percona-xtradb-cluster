@@ -426,3 +426,144 @@ should answer, not defects in the harness:
 5. Is `GU_DBUG_SYNC` actually available? The galera build sets `dbug=1`
    (`-DGU_DBUG_ON`), so one runtime
    `SET GLOBAL wsrep_provider_options='dbug=...'` answers it.
+
+---
+
+# Workload validation (antithesis-workload, 2026-09-22)
+
+## What was verified, and how
+
+All of this ran without a container runtime — see the gap below for why.
+
+1. **Assertion cataloging, by replicating the platform scanner.** An AST pass over
+   `workload/` looking for SDK assertion calls with literal messages, the same shape the
+   platform's pre-run scan uses: **32 assertions, 0 duplicate property names, 0 dynamically
+   built messages**. This is a replication of the scanner, not the scanner itself — run
+   `python -m antithesis.catalog /opt/antithesis/workload -o catalog.json` inside the built
+   image to confirm against the real one.
+2. **SDK API surface confirmed against the published source**, rather than assumed:
+   `always(condition, message, details)`, `always_or_unreachable(...)`,
+   `sometimes(...)`, `reachable(message, details)`, `unreachable(message, details)`;
+   `antithesis.random` exposes `get_random()` and `random_choice(list)`.
+   **There are no rich numeric assertion forms** in the Python SDK, so the two counter
+   bounds are written as plain `always` with the operands in the details.
+3. **Logic tests** (stubbed SDK + driver): randomness helpers including the all-zero-weight
+   case, swarm draw and its traffic-class clamp, node skew, the three-state ack protocol,
+   counter bounds as a band, swarm round-trip through SQLite, lease exclusion, lease repair,
+   and `force_all` reclamation.
+4. **Swarm distribution measured**, not eyeballed: each action class is zeroed in ~28% of
+   timelines and each lever in ~50%, matching the weight bags.
+5. **Reconcile merge-join tests**, including the false-positive guards: an unknown outcome
+   present *or* absent is not a violation; an unresolved ATTEMPTED row is treated as
+   unknown; and **a node whose scan dies mid-way is excluded rather than reported as data
+   loss**.
+6. **Every operation, DDL shape and lever forced individually** against a fake MySQL that
+   validates parameter counts — all 29 execute cleanly. This is what catches a bad
+   placeholder count in a rarely-drawn shape.
+7. **All five commands exit 0 against a totally unreachable cluster**, firing only the one
+   honest assertion (the cluster did not reconverge). Fault injection produces this state
+   constantly, and a command that crashed or exited non-zero here would report a fault as a
+   bug.
+8. **No false positives on a healthy cluster**: all 12 terminal assertions green in both
+   `eventually` and `finally` modes.
+9. **The oracle demonstrably detects.** Six divergences injected per-node, each caught by
+   exactly the right property: a silently lost acknowledged write, a content checksum
+   mismatch, a `gtid_executed` mismatch, a schema mismatch, a counter below the acked floor,
+   and a counter above the attempted ceiling (double apply).
+
+## Gap: the image build and `snouty validate` did NOT run
+
+Podman is installed and `snouty doctor` reports "Container runtime: podman detected", but
+podman **cannot execute in this sandbox**: there is no `/etc/subuid`, no passwd entry for
+uid 1000, and no container storage. `snouty doctor` only detects the binary. The successful
+build recorded in `pxc-build.log` (2026-09-22 04:37) came from a different environment.
+
+So these remain to be run where podman works:
+
+```
+docker compose -f antithesis/config/docker-compose.yaml build
+# the real cataloging scanner
+docker run --rm --entrypoint /opt/antithesis/venv/bin/python3 pxc-workload:latest \
+  -m antithesis.catalog /opt/antithesis/workload -o /tmp/catalog.json
+# the commands are present, executable, and their shebang resolves
+docker run --rm --entrypoint /bin/bash pxc-workload:latest -c \
+  'ls -l /opt/antithesis/test/v1/pxc/ && head -1 /opt/antithesis/test/v1/pxc/*'
+snouty validate ./config
+```
+
+Structural checks that *were* possible without a runtime: every `COPY` source exists
+relative to the build context, all five commands carry a recognized prefix (2 are
+driver-or-anytime, satisfying snouty's requirement), all are mode 0755, and every shebang
+points at the venv interpreter the image creates at `Dockerfile:657`.
+
+One behavioural check is worth running early because it is the failure mode most likely to
+waste a whole run: start a driver, `SIGKILL` it while it holds `gmcast.isolate`, then run
+`eventually_verify_convergence` and confirm it restores `gmcast.isolate=0` and reaches a
+quiesced comparison.
+
+## Expect the four known Galera asserts to dominate
+
+Run `b36ed60620f2dc4f939738f3f44d0906-63-0` crashed mysqld in 21 histories from network
+faults against an *idle* cluster. With real traffic they will fire more, and a crashed node
+makes the reconvergence assertion fail secondarily. The reconvergence and lineage details
+payloads carry per-node state, cluster size and unreachable reasons so triage can attribute
+it at a glance. Consider a first run with all ten `admin_lever_weight`s forced to 0, which
+separates workload-induced from fault-induced aborts before the levers add variables.
+
+## Fresh-context review, and what it found (2026-09-22)
+
+A reviewer with no prior context was given the skill definition and the code and asked to
+find assertions that can fire when PXC is *correct*. It found one severe bug and a set of
+real false-positive risks. All are fixed; the counts above reflect the pre-review state, and
+the catalog now holds **35 assertions** (16 `always`, 5 `always_or_unreachable`, 13
+`reachable`, 1 `unreachable`).
+
+**The severe one — missing `ROLLBACK`.** Four operations called `conn.begin()` but issued no
+rollback on error. MySQL rolls back only the failing *statement* on a lock-wait timeout or
+certification conflict; the transaction stays open, `SELECT 1` still succeeds so the session
+is reused, and the next `BEGIN` or any DDL **implicitly commits whatever had already
+landed**. Writes the journal recorded as FAILED would really be there, firing "a cleanly
+failed write is absent" and the counter ceiling on a correct cluster. Fixed centrally in
+`ops._rollback_quietly`, called from `_finish` so no future operation can forget, with a
+regression test that also runs the control case: without the rollback, two "failed" writes
+commit anyway.
+
+Also fixed:
+
+| Finding | Fix |
+| --- | --- |
+| `no_unresolved_ddl` fired whenever `eventually_` killed a driver mid-DDL | A DDL episode left open by a *killed* invocation is unknowable, not unresolved — the same treatment the ack journal already gave a killed write. `invocation.ended_at` distinguishes them; the abandoned count is reported, never asserted. |
+| `leases.release` deleted by lever name only | A driver whose lease had already been reclaimed could delete the **new** holder's lease and token, after which that holder's lever survived the whole terminal verification. Both deletes now carry an `inv_id` guard. `graceful_shutdown` made this near-certain: its body ran ~310s against a 240s deadline, so its hold is now derived from its actual budget. |
+| `acquire` wrote the token and the lease in two transactions | Between them "token implies lease" was false, and a repair pass read that as a leak and freed the token — letting two disruptive levers run at once, the one thing the module exists to prevent. Now one transaction. |
+| `classify` mapped an unrecognised errno to FAILED | FAILED asserts no-trace, which an unknown errno cannot support. UNKNOWN is the sound default. |
+| `locking_read` failed the property on any unrecognised errno | Inverted: only an explicitly fatal set fails. This also closed a live path — `ER_NO_SUCH_TABLE` on a schema that was never seeded. |
+| `seed` published the swarm profile before creating the schema | Drivers treat a published profile as "timeline ready", so a failed seed set every driver running against tables that did not exist. Schema first now. |
+| `applier_resize_converged` could fire for unrelated reasons | It holds no disruption token, so a concurrent `graceful_shutdown` on the same node invalidated the window. Now requires the last poll to have succeeded and the setpoint to still be ours, and asserts `>=` rather than `==` on the thread count. |
+| `saw_large_writeset` served two callsites, falsely at one | A hundred small witness inserts is ~7KB, not 4MB. Split into `saw_long_transaction`. |
+| `strict_mode_window` changed three nodes under a one-node lease | Levers in `leases.CLUSTER_WIDE` restore every node, so a killed driver no longer leaves two nodes PERMISSIVE for the rest of the run. |
+| A SQLite lock timeout exited a command non-zero | Every entry point now has a top-level guard returning 0. Exit codes carry a built-in property, so non-zero must mean a real bug. |
+| `recv_queue_bounded` was unfirable at high `fc_limit` | Absolute cap alongside the multiple: 500 × 100 allowed 50,000 queued writesets. |
+| A traffic-free timeline read as a clean run | The vacuity guard is now gated on the journal holding at least one write. |
+| `wl_witness` was unbounded on volume-less containers | Capped per timeline; `wl_bulk` and binlogs were already bounded. |
+
+Two gaps the review closed that were genuine holes in coverage, not just risk:
+
+- **Nothing compared the results of DDL across nodes.** Every DDL target is a scratch table
+  outside the checksum set, and a missing table yields an empty column signature — so a
+  table present on one node and absent on another scored as *identical*. Added
+  `checks.compare_table_set`, comparing `information_schema.tables` and `.statistics` for
+  the whole schema. It is now the detector for a TOI divergence, and it caught an injected
+  one in test.
+- **`sync_wait_read` computed the cross-node causality claim and discarded it**, keeping only
+  a tally. It is now asserted. This is the only *continuous* cross-node check in the
+  workload; the terminal oracle runs once, at the end, and cannot substitute for it.
+
+One review finding was incorrect: it reported no `.dockerignore` guarding against
+`__pycache__` reaching the catalog tree. `percona-xtradb-cluster/.dockerignore` (the build
+context root) already excludes `**/__pycache__` and `**/*.pyc`, with a comment explaining
+exactly that risk.
+
+Detection is now demonstrated for seven injected divergences: a silently lost acknowledged
+write, a content checksum mismatch, a `gtid_executed` mismatch, a column-definition
+mismatch, a table-set mismatch, and the counter breaching its floor and its ceiling.
+

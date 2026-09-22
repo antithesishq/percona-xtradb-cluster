@@ -639,7 +639,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     TERM=dumb \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PATH=/opt/antithesis/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    PATH=/opt/antithesis/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    PYTHONPATH=/opt/antithesis/workload
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
@@ -670,10 +671,25 @@ RUN chmod 0755 /opt/antithesis/setup-complete.sh /opt/antithesis/workload/entryp
 RUN set -eux; \
     mkdir -p /opt/antithesis; \
     ln -sfn /opt/antithesis/workload /opt/antithesis/catalog; \
-    test -f /opt/antithesis/catalog/entrypoint.py
+    test -f /opt/antithesis/catalog/entrypoint.py; \
+    test -f /opt/antithesis/catalog/pxcwl/oracles.py
 
-# Where antithesis-workload will drop test templates. Created here so the
-# path and ownership already exist; this skill defines no test commands.
-RUN mkdir -p /opt/antithesis/test/v1
+# The test template. Copied from antithesis/test/pxc/ specifically, not from
+# antithesis/test/, so that the README.md living beside the template does not
+# land in /opt/antithesis/test/v1/ -- Antithesis expects template DIRECTORIES
+# there, and a stray file in that position is at best noise.
+#
+# Note what is NOT here: the template contains no assertion literals. Every SDK
+# assertion lives under /opt/antithesis/workload/pxcwl/, which is what
+# /opt/antithesis/catalog points at. Cataloging does not look inside
+# /opt/antithesis/test/, so an assertion written in a command file would never
+# be cataloged -- and an uncataloged reach claim that is never hit is invisible
+# rather than failing.
+COPY antithesis/test/pxc/ /opt/antithesis/test/v1/pxc/
+RUN set -eux; \
+    chmod 0755 /opt/antithesis/test/v1/pxc/*; \
+    for f in /opt/antithesis/test/v1/pxc/*; do test -x "$f"; done; \
+    test -d /opt/antithesis/test/v1/pxc; \
+    mkdir -p /opt/antithesis/journal
 
 ENTRYPOINT ["/opt/antithesis/venv/bin/python3", "/opt/antithesis/workload/entrypoint.py"]

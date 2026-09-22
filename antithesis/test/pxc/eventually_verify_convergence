@@ -1,0 +1,22 @@
+#!/opt/antithesis/venv/bin/python3
+"""Faults have stopped and drivers were killed: quiesce and run the terminal oracle.
+
+Deliberately a thin shim. All logic -- and every Antithesis SDK assertion --
+lives in /opt/antithesis/workload/pxcwl/, because assertion cataloging scans
+/opt/antithesis/catalog (a symlink to the workload directory) and NOT
+/opt/antithesis/test/. An assertion written here would never be cataloged, and
+an uncataloged reach claim that is never hit is invisible rather than failing.
+
+Do not emit setup_complete from this or any other test command: commands only
+start after Antithesis has already observed it, so emitting it here would
+deadlock startup. The workload container's entrypoint owns it.
+"""
+
+import sys
+
+sys.path.insert(0, "/opt/antithesis/workload")
+
+from pxcwl import verify
+
+if __name__ == "__main__":
+    sys.exit(verify.run("eventually"))
