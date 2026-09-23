@@ -144,11 +144,32 @@ def applier_resize(jr, s, profile: dict) -> None:
 
 
 def maint_mode_cycle(jr, s, profile: dict) -> None:
-    """Set maintenance mode, hold it, and check it is still what we set.
+    """Set maintenance mode, hold it, and check the server did not erase it.
 
-    Pre-registered as KNOWN-RED: operator intent is expected to be silently
-    reverted on a view change. Keeping it armed is worthwhile anyway -- it is
-    the end-to-end proof that an assertion here reaches the triage report.
+    The claim is deliberately ONE-DIRECTIONAL, matching
+    scratchbook/properties/maint-mode-honors-operator-intent.md: an
+    operator-set MAINTENANCE must never be flipped back to DISABLED. Two
+    neighbouring behaviours are not violations of that, and folding them in is
+    what made this property unreadable -- of 68 reds in run afeec3df, 67 were
+    one of these two and exactly one was the real thing:
+
+      * ``observed == SHUTDOWN``. The signal handler sets it
+        (sql/mysqld.cc:4395-4404) and BOTH log_view branches carve out
+        ``!= SHUTDOWN`` (sql/wsrep_server_service.cc:196-231). Shutdown wins,
+        by design. maint_mode_cycle is also in leases.DISRUPTIVE now, so the
+        graceful_shutdown lever can no longer overlap this hold -- but an
+        unrelated crash-restart still can, so the carve-out stays.
+      * intent DISABLED, ``observed == MAINTENANCE``. That is the forced-FLIP
+        branch firing on a non-primary view (protocol -1 < V4 under default
+        ENFORCING). It belongs to no-spurious-multi-major-detection, not here.
+
+    A view change is deliberately NOT carved out. The forced-REVERT hijack --
+    the finding this property exists to make -- fires precisely on a view
+    change, when log_view sees ``wsrep_pxc_maint_mode_forced`` still set and
+    resets the mode to DISABLED even though the operator meanwhile also wanted
+    MAINTENANCE (an operator SET never clears that flag; pxc_maint_mode_update
+    is a no-op, sql/wsrep_var.cc:1096). Gating on view stability would suppress
+    exactly the evidence we are here to collect.
     """
     intent = rnd.choice(["MAINTENANCE", "DISABLED"])
     hold = float(rnd.choice([1, 5, 15]))
@@ -167,9 +188,10 @@ def maint_mode_cycle(jr, s, profile: dict) -> None:
     if conn is not None:
         try:
             actual = db.global_vars(conn, ["pxc_maint_mode"]).get("pxc_maint_mode")
-            if actual is not None:
+            observed = actual.upper() if actual is not None else None
+            if observed is not None and intent == "MAINTENANCE" and observed != "SHUTDOWN":
                 oracles.maint_mode_honors_intent(
-                    actual.upper() == intent.upper(),
+                    observed == "MAINTENANCE",
                     {
                         "node": s.name,
                         "operator_intent": intent,

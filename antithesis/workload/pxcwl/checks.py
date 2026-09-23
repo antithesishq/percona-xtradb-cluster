@@ -108,19 +108,34 @@ def compare_schemas(conns: dict[str, object], tables: list[str]) -> tuple[bool, 
     If the definitions differ, a row comparison is meaningless and the real
     finding is the schema divergence -- so this runs first and is its own
     property.
+
+    A node that cannot answer is EXCLUDED, never compared. The previous form
+    folded the exception into the signature, and an exception never equals a
+    real signature, so one transient 1205 on one node reported every table as
+    divergent. This is the same exclusion `compare_table_set` already makes.
     """
     mismatches: dict[str, dict[str, object]] = {}
+    unreadable: dict[str, dict[str, str]] = {}
     for table in tables:
         sigs: dict[str, list] = {}
+        errors: dict[str, str] = {}
         for name, conn in conns.items():
             try:
                 sigs[name] = schema.column_signature(conn, table)
             except Exception as exc:  # noqa: BLE001
-                sigs[name] = [("<error>", str(exc)[:120])]
+                errors[name] = str(exc)[:120]
+        if errors:
+            unreadable[table] = errors
+        # One readable node compares against nothing and proves nothing.
+        if len(sigs) < 2:
+            continue
         distinct = {repr(v) for v in sigs.values()}
         if len(distinct) > 1:
             mismatches[table] = {n: [c for c, _ in v] for n, v in sigs.items()}
-    return (not mismatches), {"schema_mismatches": mismatches}
+    details: dict[str, object] = {"schema_mismatches": mismatches}
+    if unreadable:
+        details["schema_unreadable"] = unreadable
+    return (not mismatches), details
 
 
 def compare_table_set(conns: dict[str, object]) -> tuple[bool, dict]:
@@ -251,8 +266,13 @@ def compare_gtid_executed(conns: dict[str, object]) -> tuple[bool, dict]:
     An independent plane from row content: rows and GTID sets can diverge
     separately, so neither check subsumes the other. Free here because
     gtid_mode=ON is already configured.
+
+    A node whose read fails is EXCLUDED, never compared: an exception string
+    differs from every real GTID set, so folding it in turned a transient 1205
+    into a reported divergence.
     """
     sets: dict[str, str] = {}
+    errors: dict[str, str] = {}
     for name, conn in conns.items():
         try:
             with conn.cursor() as cur:
@@ -264,9 +284,14 @@ def compare_gtid_executed(conns: dict[str, object]) -> tuple[bool, dict]:
                 sorted(p.strip() for p in str(raw).replace("\n", "").split(",") if p.strip())
             )
         except Exception as exc:  # noqa: BLE001
-            sets[name] = f"error: {str(exc)[:120]}"
-    distinct = set(sets.values())
-    return len(distinct) <= 1, {"gtid_executed": sets}
+            errors[name] = str(exc)[:120]
+    details: dict[str, object] = {"gtid_executed": sets}
+    if errors:
+        details["gtid_unreadable"] = errors
+    # One readable node compares against nothing and proves nothing.
+    if len(sets) < 2:
+        return True, details
+    return len(set(sets.values())) <= 1, details
 
 
 # ==========================================================================

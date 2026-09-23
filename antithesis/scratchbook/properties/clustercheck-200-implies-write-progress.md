@@ -140,3 +140,52 @@ Resolved (see Investigation Log):
 - Conclusion: resolved as a scoping decision — do not assert the read-only leg initially;
   the workload should simply never set `read_only` (or exclude windows where it does). Add
   a sub-property only if triage shows read_only=ON without workload action.
+
+### First-run evidence (runs `afeec3df…-63-0` and `de51f0b9…-63-0`, 2026-09-23)
+
+The property fired at 13.6% in `afeec3df` and 49.4% (352 counterexamples against
+360 passes) in `de51f0b9`. The second run's counterexamples were **all one
+shape**: node2, `last_probe_commit_age_s: null`, no real age anywhere in the
+failing population. Both the 120s `PXC_GREEN_WINDOW` and the FC leg were
+therefore unmeasured — the reds were a workload defect, not a green-but-dead
+node.
+
+Two findings, both now fixed in `workload/pxcwl/probe.py`:
+
+1. **`anytime_` commands run concurrently, and the probe's cross-invocation
+   state was not concurrency-safe.** One branch of `de51f0b9` logged
+   `task started pxc/anytime_cluster_probe` 50 times against 15 finishes, and
+   `all_running_tasks=['anytime_cluster_probe', 'anytime_clus…']`. Every one of
+   those processes wrote the shared `progress` row with a whole-row
+   read-modify-write, so a process whose probe had just failed stored back the
+   `last_probe_commit_at` it had read seconds earlier and erased a success
+   another process had recorded. Signature in the data: of 717 sampled
+   evaluations the age was 0 in 319, null in 355, one-off values in the rest,
+   and **negative** (-11.7s, -3.6s) in five — which a single process cannot
+   produce, since it captures `now` before probing. The fold is now
+   order-independent (MAX / COALESCE / explicit NULL) and the read-back happens
+   in the same transaction as the write.
+2. **Missing data was treated as a violation.** The condition was "no probe
+   write is recorded at or after `advertised_since`", which is also true when no
+   probe ran, when the row has not been filled in yet, and when the workload
+   container itself was the thing the network dropped. A counterexample now
+   requires an unbroken run of *refused* writes covering the window
+   (`probe_failed_since`), and the details carry `probe_failed_seconds`,
+   `probe_outcome` and `probe_reason` so the next triage can tell a node that
+   refused a write from a socket that would not open.
+
+Two premise corrections fell out of the same reading:
+
+- An unreadable `pxc_maint_mode` no longer counts as green. `clustercheck_green`
+  treats an unknown maint mode as DISABLED, which is right as a mirror of
+  `clustercheck.sh`'s formula and wrong as evidence: the real script against an
+  unreachable server does not return 200 either.
+- The commit window is the **trailing** `PXC_GREEN_WINDOW`, not "any time since
+  the node went green". The old form meant a single probe landing as the green
+  run opened exempted the node from the property for the entire rest of that
+  run, however long it then hung — which is exactly the FC-pause shape the
+  property exists to catch.
+
+`T` is still untuned: no counterexample so far has been a measured sustained
+failure, so the empirical calibration this file asks for above is still open.
+Regression coverage: `antithesis/oracle-tests/test_availability_evidence.py`.

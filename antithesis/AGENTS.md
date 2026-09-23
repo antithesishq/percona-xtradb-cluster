@@ -58,6 +58,14 @@ variant because the variable is READ_ONLY.
 `setup_complete`. `/opt/antithesis/catalog/` symlinks here for assertion
 cataloging, so **assertion names must be inline constant string literals**.
 
+**oracle-tests/**
+Runtime-free detection tests for the assertion logic, run with
+`bash antithesis/oracle-tests/run.sh`. Run them after any change to
+`workload/pxcwl/checks.py`, `oracles.py`, `levers.py` or `probe.py` — they
+inject a real divergence and assert the oracle reports it, which a smoke test
+does not.
+See `oracle-tests/README.md`.
+
 **VALIDATION.md**
 How to build and validate, what was and was not verified, and the open questions
 the first runs should answer. Read this before the first build — the local build

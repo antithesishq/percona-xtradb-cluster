@@ -1,7 +1,7 @@
 ---
 sut_path: /home/colaya/src/customer/customer-percona/percona-xtradb-cluster
-commit: f742d6a2dbc98b29ee501832930872e59e2da4e7
-updated: 2026-09-22
+commit: 8690898a7c9d70b035b1c3823c97b7f13a372e9e
+updated: 2026-09-23
 external_references:
   - path: https://docs.percona.com/percona-xtradb-cluster/8.4/
     why: Upstream product documentation (user-approved scope: repo + upstream docs)
@@ -105,6 +105,65 @@ checksum set, and a missing table scored as identical), and the cross-node causa
 in `sync_wait_read` was computed and discarded. Both are now asserted — see
 `../VALIDATION.md` for the full review findings, including a severe missing-`ROLLBACK` bug
 that would have fired the no-trace assertion on a correct cluster.
+
+### Post-triage corrections (run `afeec3df…-63-0`, 2026-09-23)
+
+Three oracle defects found in triage, all workload-side, all fixed:
+
+- `checks.compare_schemas` and `checks.compare_gtid_executed` folded a query
+  exception into the value they compared across nodes. An exception never equals a
+  real signature or GTID set, so one transient ER 1205 on one node reported every
+  table as divergent. 287 + 88 of the run's counterexamples were this artifact.
+  Unreadable nodes are now EXCLUDED from the comparison (the exclusion
+  `compare_table_set` already made) and surfaced separately as
+  `schema_unreadable` / `gtid_unreadable`. A comparison with fewer than two
+  readable nodes makes no claim.
+- `maint_mode_cycle` was missing from `leases.DISRUPTIVE`, so `graceful_shutdown`
+  ran concurrently and the shutdown path's forced `pxc_maint_mode=SHUTDOWN`
+  invalidated the hold. Now shares the disruption token.
+- The maint-mode assertion claimed a two-way equality the property never meant.
+  Of its 68 reds, 45 were `observed=SHUTDOWN` (documented carve-out: both
+  `log_view` branches exempt SHUTDOWN), 21 were the forced-FLIP to MAINTENANCE
+  (owned by `no-spurious-multi-major-detection`, not this property), and exactly
+  **1 was the real forced-revert hijack**. Narrowed to the one direction the
+  evidence file describes and renamed accordingly — see that entry below.
+
+### Post-triage corrections (run `de51f0b9…-63-0`, 2026-09-23)
+
+The two fixes above verified: schema divergence 88 → 0 counterexamples, and the
+narrowed maint-mode property passed 48 evaluations with none. One new
+workload-side oracle defect, which the quieter report made the largest red
+(13.6% → 49.4%), fixed here:
+
+- `clustercheck-200-implies-write-progress` fired 352 counterexamples and
+  **every one of them carried `last_probe_commit_age_s: null`** — no successful
+  probe write on record — with zero carrying a real age. Two causes, both fixed
+  in `probe.py`:
+  - Antithesis runs several instances of an `anytime_` command concurrently (one
+    branch started 50 `anytime_cluster_probe` processes against 15 finished).
+    All of them write the shared `progress` row, and the old whole-row
+    read-modify-write let a process whose probe had just failed store back the
+    `last_probe_commit_at` it had read seconds earlier, erasing a success
+    another process had recorded in between. The evidence is in the age
+    histogram: 319 zeros, 355 nulls, a thin tail of one-offs, and five
+    **negative** ages — a timestamp written by a process whose clock read was
+    ahead of the asserting one. `_merge_progress` now folds each field with an
+    operator two writers can apply in any order (MAX for monotone clocks,
+    COALESCE for latching marks, explicit NULL only from the process that saw
+    the condition end) and re-reads inside the same transaction, so the
+    assertion judges the merged view rather than one process's stale snapshot.
+  - "No successful probe is on record" is not "the node refused writes". The
+    claim now needs positive evidence either way: a probe that landed inside the
+    trailing green window, or an unbroken run of refused writes covering it
+    (`probe_failed_since`). With neither, nothing is asserted. Counterexamples
+    now carry `probe_failed_seconds`, `probe_outcome` and `probe_reason`, which
+    is what triage needed to tell a refused write from an unopenable socket.
+- Two narrower fixes in the same path: an unreadable `pxc_maint_mode` no longer
+  counts as green (`clustercheck_green` treats unknown as DISABLED, correct for
+  mirroring the script's formula, wrong as evidence about a node we could not
+  question), and the commit window is now the trailing `PXC_GREEN_WINDOW`
+  rather than "any time since the node went green" — one probe landing as the
+  green run opened used to exempt the node for as long as it then stayed wedged.
 
 ### Commands
 
@@ -1374,6 +1433,13 @@ Priority: **High** — oracle-integrity property; the deadlock is verified reach
 | **Invariant** | Workload `Always` vs an operator-intent ledger + `Sometimes` ×2 (missing markers) on the forced-flip and forced-revert branches — `Sometimes`, NOT `Unreachable`, in the release image: every non-primary view fires the forcing branch in a homogeneous cluster (see Angle), and the next primary view force-reverts. |
 | **Antithesis Angle** | VERIFIED: `log_view` — the forced flag's SOLE writer (tree-wide sweep) — force-flips the mode (`wsrep_server_service.cc:196-231`), and an operator SET never clears the forced flag (update fn is a no-op, `wsrep_var.cc:1096`). Release-reachable with plain network faults: every NON-PRIMARY view carries `appl_proto_ver = -1` (`GCS_QUORUM_NON_PRIMARY`, `gcs_state_msg.hpp:78-85`), `log_view` runs for ALL view statuses, and -1 < V4 forces MAINTENANCE + the forced flag under default ENFORCING; the next primary view force-reverts to DISABLED. An operator drain set before/during the partition is thus silently ERASED at heal — the node re-enters rotation mid-maintenance. The DBUG multi-major knob remains a debug-image amplifier, not a prerequisite. (The earlier 10s-SET-sleep-holds-MDL claim is retracted — the sleep holds no MDL and only delays the operator's session.) |
 | **Why It Matters** | clustercheck requires DISABLED for 200 → a spurious flip returns a draining node to rotation mid-maintenance; forced-MAINTENANCE cluster-wide = all-503 blackhole. The forced-flip/revert hijack of operator intent is a real release-build finding reachable with default network faults. |
+
+**Implemented as:** `an operator-set pxc_maint_mode=MAINTENANCE is never reverted to DISABLED`
+(`always_or_unreachable`, `workload/pxcwl/levers.py::maint_mode_cycle`). Renamed 2026-09-23
+from "pxc_maint_mode matches the last operator-set value until the operator changes it",
+which promised a two-way equality this property never meant. Carve-outs: `observed ==
+SHUTDOWN`, and the intent-DISABLED/forced-MAINTENANCE direction. A view change is NOT
+carved out — the forced-revert hijack fires precisely on one.
 
 Priority: **High — KNOWN-RED from run one (synthesis)**: the forced flip fires on every non-primary view under partitions, so the `Always` is expected to fail immediately — pre-register the forced-flip/revert arm as an expected finding (bug-finder) with a carve-out so the remainder of the intent ledger still guards regressions (see Shared conventions). Provenance: focus 8, reconciled with focus 10's non-primary protocol -1 chain (which supersedes the earlier "Unreachable in release" conclusion).
 

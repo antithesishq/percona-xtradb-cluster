@@ -101,6 +101,7 @@ CREATE TABLE IF NOT EXISTS progress (
   last_advance_at      REAL    NOT NULL,
   advertised_since     REAL,
   last_probe_commit_at REAL,
+  probe_failed_since   REAL,
   wedge_since          REAL,
   advertised_fc_paused INTEGER
 );
@@ -148,6 +149,7 @@ class Journal:
         # timeout above rather than silently lowering it.
         self.conn.execute("PRAGMA busy_timeout = 30000")
         self.conn.executescript(SCHEMA_SQL)
+        self._add_missing_columns()
         self.conn.commit()
 
         cur = self.conn.execute(
@@ -157,6 +159,24 @@ class Journal:
         self.inv_id = int(cur.lastrowid)
         self.conn.commit()
         self._seq = 0
+
+    # CREATE TABLE IF NOT EXISTS silently keeps an older table shape, so a
+    # journal file left over from a previous build would be missing columns
+    # added since -- and every write against it would fail inside a broad
+    # except and vanish. Cheap enough to just reconcile on open.
+    ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
+        ("progress", "probe_failed_since", "REAL"),
+    )
+
+    def _add_missing_columns(self) -> None:
+        for table, column, decl in self.ADDED_COLUMNS:
+            have = {
+                r["name"] for r in self.conn.execute(f"PRAGMA table_info({table})")
+            }
+            if column not in have:
+                self.conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {column} {decl}"
+                )
 
     # ---------------------------------------------------------------- lifecycle
 

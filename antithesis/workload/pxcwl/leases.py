@@ -35,6 +35,12 @@ DISRUPTIVE: frozenset[str] = frozenset(
         "desync_cycle",
         "strict_mode_window",
         "ws_size_squeeze",
+        # Shares the token specifically so it cannot overlap
+        # graceful_shutdown: the shutdown path force-sets pxc_maint_mode to
+        # SHUTDOWN (sql/wsrep_server_service.cc), which is the same variable
+        # maint_mode_cycle is holding, so a concurrent pair made the
+        # maint-mode claim compare against a value the operator never set.
+        "maint_mode_cycle",
     }
 )
 

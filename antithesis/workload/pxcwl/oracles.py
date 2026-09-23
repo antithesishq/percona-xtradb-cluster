@@ -164,6 +164,11 @@ def green_node_can_commit(ok: bool, details: Details) -> None:
 
     The shipped check never consults wsrep_ready, flow-control state, or queue
     depth, so a node can advertise availability while every write on it hangs.
+
+    Only evaluated when the probe has positive evidence either way: a write it
+    landed inside the green window, or an unbroken run of refused writes
+    covering it. "No successful probe is on record" is not the same claim --
+    see probe._merge_progress for how it came to be one in run de51f0b9-63-0.
     """
     always(
         ok,
@@ -230,9 +235,18 @@ def applier_resize_converged(ok: bool, details: Details) -> None:
 
 
 def maint_mode_honors_intent(ok: bool, details: Details) -> None:
+    """One direction only, and the name says which.
+
+    Renamed from "pxc_maint_mode matches the last operator-set value until the
+    operator changes it", which promised a two-way equality the property never
+    meant. SHUTDOWN and the forced-FLIP to MAINTENANCE are both legitimate
+    server-side overrides, so only the revert-to-DISABLED arm is a violation.
+    See levers.maint_mode_cycle for the carve-outs and why a view change is
+    not one of them.
+    """
     always_or_unreachable(
         ok,
-        "pxc_maint_mode matches the last operator-set value until the operator changes it",
+        "an operator-set pxc_maint_mode=MAINTENANCE is never reverted to DISABLED",
         details,
     )
 

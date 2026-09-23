@@ -36,6 +36,7 @@ def _progress_row(jr, node: str) -> dict:
             "last_advance_at": now,
             "advertised_since": None,
             "last_probe_commit_at": None,
+            "probe_failed_since": None,
             "wedge_since": None,
             "advertised_fc_paused": None,
         }
@@ -76,21 +77,26 @@ PROBE_FAILED = "failed"
 PROBE_NO_SCHEMA = "no_schema"
 
 
-def _probe_write(host: str, node: str) -> str:
+def _probe_write(host: str, node: str) -> tuple[str, str | None]:
     """Try to actually commit something. The health surface never checks this.
 
-    Returns PROBE_OK, PROBE_FAILED, or PROBE_NO_SCHEMA. The last one is the
-    important one: if the workload schema is not there (the first_ command's
-    node was unreachable when it ran, which fault injection makes routine),
-    then a failed write is a harness condition rather than evidence about the
-    node, and no assertion may be based on it.
+    Returns (outcome, reason). The outcome is PROBE_OK, PROBE_FAILED or
+    PROBE_NO_SCHEMA. The last one is the important one: if the workload schema
+    is not there (the first_ command's node was unreachable when it ran, which
+    fault injection makes routine), then a failed write is a harness condition
+    rather than evidence about the node, and no assertion may be based on it.
+
+    The reason is why a non-OK outcome happened, carried into the assertion's
+    details. Triage of run de51f0b9-63-0 could not tell a node that refused a
+    write from a node the workload could not open a socket to, because the
+    only thing recorded was that no write had landed.
     """
     conn = db.connect_with_retry(host, config.SCHEMA, attempts=1)
     if conn is None:
         # Could we reach the server at all, just not the schema?
         bare = db.connect_with_retry(host, attempts=1)
         if bare is None:
-            return PROBE_FAILED
+            return PROBE_FAILED, f"connect: {db.LAST_ERROR.get(host, 'unreachable')}"
         try:
             with bare.cursor() as cur:
                 cur.execute(
@@ -99,9 +105,11 @@ def _probe_write(host: str, node: str) -> str:
                     (config.SCHEMA,),
                 )
                 exists = int(cur.fetchone()[0]) > 0
-            return PROBE_FAILED if exists else PROBE_NO_SCHEMA
-        except Exception:  # noqa: BLE001
-            return PROBE_FAILED
+            if exists:
+                return PROBE_FAILED, "schema connect failed but wl_probe exists"
+            return PROBE_NO_SCHEMA, "wl_probe absent"
+        except Exception as exc:  # noqa: BLE001
+            return PROBE_FAILED, f"{type(exc).__name__}: {str(exc)[:120]}"
         finally:
             db.close_quietly(bare)
     try:
@@ -113,12 +121,74 @@ def _probe_write(host: str, node: str) -> str:
             if cur.rowcount == 0:
                 # Schema present but unseeded: an UPDATE matching no row
                 # commits nothing, so it proves nothing either.
-                return PROBE_NO_SCHEMA
-        return PROBE_OK
-    except Exception:  # noqa: BLE001
-        return PROBE_FAILED
+                return PROBE_NO_SCHEMA, "wl_probe row for this node not seeded"
+        return PROBE_OK, None
+    except Exception as exc:  # noqa: BLE001
+        return PROBE_FAILED, f"{type(exc).__name__}: {str(exc)[:120]}"
     finally:
         db.close_quietly(conn)
+
+
+def _merge_progress(
+    jr,
+    node: str,
+    *,
+    now: float,
+    committed: int,
+    advanced: bool,
+    green: bool,
+    fc_paused: int,
+    probe: str,
+    wedged: bool,
+) -> dict:
+    """Fold one observation into the shared row; return the merged state.
+
+    Antithesis runs several instances of an anytime_ command concurrently --
+    one branch of run de51f0b9-63-0 started 50 probe processes and finished 15
+    -- and every one of them writes this row. The previous read-modify-write
+    let a process whose probe had just failed write back the
+    last_probe_commit_at it had read seconds earlier, erasing a success another
+    process had recorded in between. That, not a node that could not commit, is
+    what produced 355 counterexamples with last_probe_commit_age_s = null.
+
+    So every field folds with an operator two concurrent writers can apply in
+    any order: MAX for the monotone clocks, COALESCE for marks that latch on
+    first observation, and an explicit NULL only from the process that actually
+    observed the latching condition end. The read-back happens inside the same
+    transaction, so the assertions below judge the merged view rather than one
+    process's stale snapshot.
+    """
+    probe_commit = now if probe == PROBE_OK else 0.0
+    with jr.conn:
+        jr.conn.execute(
+            "UPDATE progress SET "
+            "  last_committed = MAX(last_committed, ?), "
+            "  last_advance_at = MAX(last_advance_at, ?), "
+            "  advertised_fc_paused = CASE WHEN NOT ? THEN NULL "
+            "                              WHEN advertised_since IS NULL THEN ? "
+            "                              ELSE advertised_fc_paused END, "
+            "  advertised_since = CASE WHEN ? THEN COALESCE(advertised_since, ?) END, "
+            "  last_probe_commit_at = CASE "
+            "      WHEN ? > COALESCE(last_probe_commit_at, 0) THEN ? "
+            "      ELSE last_probe_commit_at END, "
+            "  probe_failed_since = CASE WHEN ? THEN COALESCE(probe_failed_since, ?) END, "
+            "  wedge_since = CASE WHEN ? THEN COALESCE(wedge_since, ?) END "
+            "WHERE node = ?",
+            (
+                committed,
+                now if advanced else 0.0,
+                green, fc_paused,
+                green, now,
+                probe_commit, probe_commit,
+                probe == PROBE_FAILED, now,
+                wedged, now,
+                node,
+            ),
+        )
+        row = jr.conn.execute(
+            "SELECT * FROM progress WHERE node = ?", (node,)
+        ).fetchone()
+    return dict(row)
 
 
 def run() -> int:
@@ -246,10 +316,12 @@ def _run() -> int:
 
                 # ------------------------------------------ health truthfulness
                 maint = None
+                maint_read = False
                 conn = db.connect_with_retry(host, attempts=1)
                 if conn is not None:
                     try:
                         maint = db.global_vars(conn, ["pxc_maint_mode"]).get("pxc_maint_mode")
+                        maint_read = bool(maint)
                     except Exception:  # noqa: BLE001
                         maint = None
                     try:
@@ -262,67 +334,20 @@ def _run() -> int:
                     finally:
                         db.close_quietly(conn)
 
-                green = db.clustercheck_green(st, maint)
-                advertised_since = prog["advertised_since"]
-                advertised_fc_paused = prog["advertised_fc_paused"]
-                if green:
-                    if advertised_since is None:
-                        advertised_since = now
-                        advertised_fc_paused = fc_paused
-                else:
-                    advertised_since = None
-                    advertised_fc_paused = None
+                # clustercheck_green treats an unknown pxc_maint_mode as
+                # DISABLED, which is right for mirroring the script's formula
+                # and wrong as evidence: a maint mode we could not read is a
+                # node we could not question, not a node advertising itself.
+                green = maint_read and db.clustercheck_green(st, maint)
 
-                probe = _probe_write(host, name)
+                probe, probe_reason = _probe_write(host, name)
                 wrote = probe == PROBE_OK
                 no_evidence = probe == PROBE_NO_SCHEMA
-                last_probe_commit_at = (
-                    now if wrote else prog["last_probe_commit_at"]
-                )
-
                 if no_evidence:
-                    # Restart both windows: neither the health claim nor the
-                    # wedge watchdog can be judged without a usable probe.
-                    advertised_since = None
-
-                if (
-                    green
-                    and not no_evidence
-                    and advertised_since is not None
-                    and now - advertised_since >= config.GREEN_WINDOW_SECONDS
-                ):
-                    committed_in_window = (
-                        last_probe_commit_at is not None
-                        and last_probe_commit_at >= advertised_since
-                    )
-                    oracles.green_node_can_commit(
-                        committed_in_window,
-                        {
-                            "node": name,
-                            "advertised_seconds": round(now - advertised_since, 1),
-                            "window_seconds": config.GREEN_WINDOW_SECONDS,
-                            "last_probe_commit_age_s": (
-                                round(now - last_probe_commit_at, 1)
-                                if last_probe_commit_at
-                                else None
-                            ),
-                            "local_state": local_state,
-                            "pxc_maint_mode": maint,
-                            # A flow-control pause is one of the real
-                            # mechanisms this property attacks -- a paused
-                            # Synced node keeps advertising available -- so the
-                            # check stays armed. This delta is what lets triage
-                            # separate a genuine wedge from a legitimately long
-                            # pause, and it is the measurement that calibrates
-                            # GREEN_WINDOW_SECONDS.
-                            "fc_paused_ns_delta": (
-                                fc_paused - advertised_fc_paused
-                                if advertised_fc_paused is not None
-                                else None
-                            ),
-                            "fc_active": st.get("wsrep_flow_control_active"),
-                        },
-                    )
+                    # Neither the health claim nor the wedge watchdog can be
+                    # judged without a usable probe, so drop the green window
+                    # with it.
+                    green = False
 
                 # ---------------------------------------------- wedge watchdog
                 # Everyone claims Synced and Primary, nobody is transferring
@@ -335,12 +360,86 @@ def _run() -> int:
                     and local_state == "4"
                     and not no_evidence
                 )
-                wedge_since = prog["wedge_since"]
-                if healthy_claim and not advanced and not wrote:
-                    if wedge_since is None:
-                        wedge_since = now
-                else:
-                    wedge_since = None
+                wedged = healthy_claim and not advanced and not wrote
+
+                merged = _merge_progress(
+                    jr,
+                    name,
+                    now=now,
+                    committed=committed,
+                    advanced=advanced,
+                    green=green,
+                    fc_paused=fc_paused,
+                    probe=probe,
+                    wedged=wedged,
+                )
+                advertised_since = merged["advertised_since"]
+                advertised_fc_paused = merged["advertised_fc_paused"]
+                last_probe_commit_at = merged["last_probe_commit_at"]
+                probe_failed_since = merged["probe_failed_since"]
+                wedge_since = merged["wedge_since"]
+
+                if (
+                    green
+                    and advertised_since is not None
+                    and now - advertised_since >= config.GREEN_WINDOW_SECONDS
+                ):
+                    # The trailing window, not "any time since the node went
+                    # green": otherwise one probe that landed the moment the
+                    # green run opened would exempt the node from the property
+                    # for as long as it then stayed wedged.
+                    floor = max(advertised_since, now - config.GREEN_WINDOW_SECONDS)
+                    committed_in_window = (
+                        last_probe_commit_at is not None
+                        and last_probe_commit_at >= floor
+                    )
+                    # A violation needs positive evidence that writes were
+                    # tried and refused for the whole window -- "no successful
+                    # probe is on record" also describes a probe that never
+                    # ran, a journal row another process has not filled in yet,
+                    # and a workload container the network dropped. Those say
+                    # nothing about the node, so they are not judged at all.
+                    sustained_failure = (
+                        probe_failed_since is not None
+                        and now - probe_failed_since >= config.GREEN_WINDOW_SECONDS
+                    )
+                    if committed_in_window or sustained_failure:
+                        oracles.green_node_can_commit(
+                            committed_in_window,
+                            {
+                                "node": name,
+                                "advertised_seconds": round(now - advertised_since, 1),
+                                "window_seconds": config.GREEN_WINDOW_SECONDS,
+                                "last_probe_commit_age_s": (
+                                    round(now - last_probe_commit_at, 1)
+                                    if last_probe_commit_at
+                                    else None
+                                ),
+                                "probe_failed_seconds": (
+                                    round(now - probe_failed_since, 1)
+                                    if probe_failed_since
+                                    else None
+                                ),
+                                "probe_outcome": probe,
+                                "probe_reason": probe_reason,
+                                "local_state": local_state,
+                                "pxc_maint_mode": maint,
+                                # A flow-control pause is one of the real
+                                # mechanisms this property attacks -- a paused
+                                # Synced node keeps advertising available -- so
+                                # the check stays armed. This delta is what lets
+                                # triage separate a genuine wedge from a
+                                # legitimately long pause, and it is the
+                                # measurement that calibrates
+                                # GREEN_WINDOW_SECONDS.
+                                "fc_paused_ns_delta": (
+                                    fc_paused - advertised_fc_paused
+                                    if advertised_fc_paused is not None
+                                    else None
+                                ),
+                                "fc_active": st.get("wsrep_flow_control_active"),
+                            },
+                        )
 
                 if wedge_since is not None and now - wedge_since >= config.WEDGE_WINDOW_SECONDS:
                     oracles.commit_progress_not_frozen(
@@ -353,6 +452,7 @@ def _run() -> int:
                             "recv_queue": recv_queue,
                             "flow_control_paused_ns": st.get("wsrep_flow_control_paused_ns"),
                             "probe_write_succeeded": wrote,
+                            "probe_reason": probe_reason,
                         },
                     )
                 elif healthy_claim and (advanced or wrote):
@@ -364,22 +464,6 @@ def _run() -> int:
                             "advanced": advanced,
                             "probe_write_succeeded": wrote,
                         },
-                    )
-
-                with jr.conn:
-                    jr.conn.execute(
-                        "UPDATE progress SET last_committed = ?, last_advance_at = ?, "
-                        "advertised_since = ?, last_probe_commit_at = ?, wedge_since = ?, "
-                        "advertised_fc_paused = ? WHERE node = ?",
-                        (
-                            committed,
-                            now if advanced else prog["last_advance_at"],
-                            advertised_since,
-                            last_probe_commit_at,
-                            wedge_since,
-                            advertised_fc_paused,
-                            name,
-                        ),
                     )
 
             if saw_small_cluster:

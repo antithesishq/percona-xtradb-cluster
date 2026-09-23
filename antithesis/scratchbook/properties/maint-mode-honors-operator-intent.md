@@ -187,3 +187,37 @@ Resolved (see Investigation Log):
 ## Synthesis refinement (2026-09-10)
 
 KNOWN-RED pre-registration: the forced flip fires on every non-primary view under partitions — the Always is expected to fail from run one (deliberate bug-finder). Pre-register the forced-flip/revert arm as a known finding with a carve-out so the remaining intent-ledger checks still guard regressions.
+
+## First-run evidence (run `afeec3df4338f14ada334136f1794bac-63-0`, 2026-09-23)
+
+The property fired 776 times: 708 green, 68 red. Breaking the reds down by
+`(operator_intent, observed)` is what made the entry above actionable, because
+only one of the three shapes is this property:
+
+| count | intent | observed | verdict |
+|---|---|---|---|
+| 45 | MAINTENANCE | SHUTDOWN | **not a violation** — the signal handler sets SHUTDOWN (`sql/mysqld.cc:4395-4404`) and both `log_view` branches carve out `!= SHUTDOWN`. Shutdown wins by design. Compounded by a harness bug: `maint_mode_cycle` was not in `leases.DISRUPTIVE`, so the `graceful_shutdown` lever ran concurrently with the hold. |
+| 21 | DISABLED | MAINTENANCE | **not a violation of THIS property** — the forced-FLIP branch (`wsrep_server_service.cc:203-215`) firing on a non-primary view, exactly as the "Non-primary -1 finding" chain predicted. Owned by `no-spurious-multi-major-detection`. |
+| 1 | MAINTENANCE | DISABLED | **the finding.** The forced-REVERT hijack this property was written to catch. |
+| 1 | DISABLED | SHUTDOWN | carve-out, as row 1. |
+
+So the release-build, network-faults-only reachability predicted in the
+Antithesis Angle is CONFIRMED on both arms: the forced flip is common (21
+observations) and the operator-drain erasure reproduced once in 120 minutes.
+
+Consequences for the implementation, applied 2026-09-23:
+
+- The workload assertion was a two-way equality, which is broader than the
+  claim. It is now one-directional (intent MAINTENANCE reverted to DISABLED)
+  and renamed to `an operator-set pxc_maint_mode=MAINTENANCE is never reverted
+  to DISABLED`.
+- SHUTDOWN and the forced-FLIP direction are carved out explicitly.
+- A view change is deliberately NOT carved out. An earlier attempt at this fix
+  gated the claim on `wsrep_cluster_conf_id` being unchanged across the hold;
+  that was wrong and was reverted — `log_view` runs ON the view change, so the
+  gate would have suppressed the single real observation above.
+- `maint_mode_cycle` joined `leases.DISRUPTIVE` so it can no longer overlap
+  `graceful_shutdown`. The SHUTDOWN carve-out stays anyway, because an
+  unrelated crash-restart can still set it.
+
+**Open question resolved:** none. The ProxySQL v2 question above is untouched.
