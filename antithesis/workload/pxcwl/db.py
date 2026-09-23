@@ -71,6 +71,25 @@ FATAL_STATEMENT_ERRNOS: frozenset[int] = frozenset(
     {ER_PARSE_ERROR, ER_WRONG_ARGUMENTS, ER_CRASHED_ON_USAGE, ER_NOT_SUPPORTED_YET}
 )
 
+# Errnos a SCHEMA DDL statement may legitimately hit because of the
+# environment. Deliberately NOT CLEAN_REJECTIONS: that set exists for the
+# statement path and includes ER_UNKNOWN_ERROR (1105), which is how PXC reports
+# a strict-mode rejection. Treating 1105 as environment here would put us right
+# back where run a359f1f8-63-0 was -- a seed that fails, exits 0, and produces a
+# green report over a workload that never ran.
+SCHEMA_DDL_ENVIRONMENT_ERRNOS: frozenset[int] = frozenset(
+    {
+        CR_SERVER_GONE_ERROR,
+        CR_SERVER_LOST,
+        ER_UNKNOWN_COM_ERROR,          # node not ready; it will be later
+        ER_LOCK_WAIT_TIMEOUT,          # TOI waiting behind something
+        ER_LOCK_DEADLOCK,
+        ER_QUERY_INTERRUPTED,          # killed mid-DDL
+        ER_OPTION_PREVENTS_STATEMENT,
+        ER_CANT_EXECUTE_IN_READ_ONLY,
+    }
+)
+
 LAST_ERROR: dict[str, str] = {}
 
 
@@ -144,6 +163,24 @@ def is_alive(conn) -> bool:
         return True
     except Exception:  # noqa: BLE001
         return False
+
+
+def schema_ddl_failure_is_environmental(conn, exc: BaseException) -> bool:
+    """Whether a failed schema DDL says something about PXC or about us.
+
+    A server that answered, is still answering, and rejected our DDL for a
+    reason outside SCHEMA_DDL_ENVIRONMENT_ERRNOS has told us the DDL is wrong.
+    That is a harness bug and the seed must exit non-zero for it. Everything
+    else -- a dropped connection, a node that is not ready, a killed
+    statement -- is fault injection doing its job.
+    """
+    errno = errno_of(exc)
+    if errno is None:
+        # No errno at all means it never got as far as a server verdict.
+        return True
+    if errno in SCHEMA_DDL_ENVIRONMENT_ERRNOS:
+        return True
+    return not is_alive(conn)
 
 
 # --------------------------------------------------------------------------

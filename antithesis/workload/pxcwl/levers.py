@@ -415,13 +415,27 @@ def ws_size_squeeze(jr, s, profile: dict) -> None:
 
 
 def strict_mode_window(jr, s, profile: dict) -> None:
-    """A fenced window where PK-less DML is legal.
+    """A fenced window for PK-less work.
 
-    pxc_strict_mode=ENFORCING blocks DML on primary-key-less tables, but
     PK-less tables are a genuine divergence lever -- certification falls back
-    to hashing the whole row. So the window is opened on all three nodes,
-    used briefly, and always restored. The resulting rows are compared under
-    their own property name so a red there cannot mask the real invariant.
+    to hashing the whole row -- so the window is opened on all three nodes,
+    used briefly, and always restored. The rows are compared under their own
+    property name so a red there cannot mask the real invariant.
+
+    Correction to an earlier claim in this file: pxc_strict_mode does NOT
+    block plain DML on an existing PK-less table. The only PK check on the
+    write path is INSERT through a VIEW over a PK-less base table
+    (sql/sql_insert.cc:263), which this workload never does. The INSERTs below
+    would run even with the window closed. What the window is really for is
+    `sql_require_primary_key`, which gates CREATE and ALTER (errno 3750) and
+    cannot be turned off at all while pxc_strict_mode is ENFORCING
+    (sql/sys_vars.cc). It is lowered here so that the window means what its
+    name says -- PK-less operations, DDL included, are legal inside it -- and
+    because leaving the two halves of the fence in different places is how
+    `wl_nopk` came to be missing for an entire run in the first place.
+
+    Order matters and mirrors leases.RESTORE_SQL: strict mode down first, then
+    the PK requirement; the lease restores them in the opposite order.
     """
     if not bool(profile.get("pkless_enabled", False)):
         return
@@ -437,6 +451,7 @@ def strict_mode_window(jr, s, profile: dict) -> None:
     try:
         for _, host in config.NODES:
             _set_global(host, "SET GLOBAL pxc_strict_mode = PERMISSIVE")
+            _set_global(host, "SET GLOBAL sql_require_primary_key = OFF")
         try:
             with s.conn.cursor() as cur:
                 for _ in range(int(rnd.choice([1, 5, 20]))):

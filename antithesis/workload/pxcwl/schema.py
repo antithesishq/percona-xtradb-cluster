@@ -1,9 +1,32 @@
 """Workload schema.
 
 Every table carries an explicit PRIMARY KEY, with exactly one deliberate
-exception (``wl_nopk``). This is not a style choice: pxc_strict_mode is left at
-the ENFORCING default, which blocks DML on primary-key-less tables outright, so
-a PK-less table can only be written inside a fenced PERMISSIVE window.
+exception (``wl_nopk``), which is created separately by ``create_nopk`` inside
+a fenced window. What the fence is for, verified against this tree's own
+sources rather than assumed:
+
+* ``pxc_strict_mode`` is left at its ENFORCING default, and raising it to
+  ENFORCING force-sets ``sql_require_primary_key=ON`` globally
+  (``sql/wsrep_var.cc`` ``pxc_strict_mode_update``).
+* ``sql_require_primary_key=ON`` rejects a PK-less CREATE with errno 3750, and
+  setting it OFF is itself rejected while ``pxc_strict_mode`` is ENFORCING
+  (``sql/sys_vars.cc``
+  ``check_session_admin_and_sql_require_primary_key_on_check``). So the strict
+  mode has to come down first, and go back up last.
+* ``pxc_strict_mode`` is GLOBAL-only (``sql/sys_vars.cc`` ``Sys_pxc_strict_mode``
+  is a ``GLOBAL_VAR``), so the fence cannot be session-scoped.
+* The session value is enough for the OTHER nodes. A CREATE TABLE writeset
+  carries ``Q_SQL_REQUIRE_PRIMARY_KEY`` (``sql/log_event.cc``
+  ``is_sql_require_primary_key_needed``), and every applier adopts it because
+  the default channel policy is ``PK_CHECK_STREAM`` (``sql/rpl_rli.cc``
+  constructor, consumed at ``sql/log_event.cc:4829``). Without that the CREATE
+  would succeed on the donor and fail on the appliers, which is a harness-made
+  schema divergence -- strictly worse than the CREATE failing outright.
+
+Note what the fence is NOT for: nothing in this tree blocks plain DML on an
+existing PK-less table. The only ``pxc_strict_mode`` PK check on the write path
+is for INSERT through a VIEW whose base table has no PK
+(``sql/sql_insert.cc:263``), which this workload never does.
 
 None of the new tables use TIMESTAMP DEFAULT CURRENT_TIMESTAMP. Row-based
 replication ships the evaluated value so it would in fact be safe, but these
@@ -91,16 +114,19 @@ WORKLOAD_TABLES: list[str] = [
          at   BIGINT NOT NULL DEFAULT 0,
          PRIMARY KEY (node)
        ) ENGINE=InnoDB""",
-    # The one PK-less table. Only ever written inside a fenced PERMISSIVE
-    # window, and compared under its own property name.
-    """CREATE TABLE IF NOT EXISTS `wl_nopk` (
+]
+
+# The one PK-less table. Deliberately NOT in WORKLOAD_TABLES: it is the only
+# table whose CREATE needs the fence, and having it in the main list made one
+# rejected statement abort the whole seed. Compared under its own property name.
+NOPK_DDL = """CREATE TABLE IF NOT EXISTS `wl_nopk` (
          a INT NOT NULL,
          b VARCHAR(64) NOT NULL
-       ) ENGINE=InnoDB""",
-]
+       ) ENGINE=InnoDB"""
 
 
 def create_all(conn) -> None:
+    """Every table except `wl_nopk`. See create_nopk for that one."""
     with conn.cursor() as cur:
         cur.execute(f"CREATE DATABASE IF NOT EXISTS `{SCHEMA}`")
         cur.execute(f"USE `{SCHEMA}`")
@@ -108,6 +134,38 @@ def create_all(conn) -> None:
             cur.execute(ddl)
         for name in config.SCRATCH_TABLES:
             cur.execute(_SCRATCH_DDL.format(name=name))
+
+
+def create_nopk(conn) -> None:
+    """Create `wl_nopk` inside a PK-less fence. See the module docstring.
+
+    The caller owns the lease that guarantees the fence is closed even if this
+    command is killed between the two halves; the `finally` here only covers
+    the ordinary path. Restoring pxc_strict_mode to ENFORCING also puts the
+    GLOBAL sql_require_primary_key back on its own
+    (sql/wsrep_var.cc pxc_strict_mode_update), but it is restored explicitly
+    anyway rather than resting on a side effect.
+    """
+    with conn.cursor() as cur:
+        cur.execute(f"USE `{SCHEMA}`")
+        cur.execute("SET GLOBAL pxc_strict_mode = PERMISSIVE")
+        try:
+            cur.execute("SET SESSION sql_require_primary_key = OFF")
+            cur.execute(NOPK_DDL)
+        finally:
+            # Best-effort, and deliberately so: if the node died mid-CREATE
+            # these will fail too, and re-raising from the finally would
+            # replace the real error with a connection error. The lease is
+            # what actually guarantees the fence closes.
+            for stmt in (
+                "SET SESSION sql_require_primary_key = ON",
+                "SET GLOBAL sql_require_primary_key = ON",
+                "SET GLOBAL pxc_strict_mode = ENFORCING",
+            ):
+                try:
+                    cur.execute(stmt)
+                except Exception:  # noqa: BLE001 - lease repair is the backstop
+                    pass
 
 
 def seed_rows(conn) -> None:

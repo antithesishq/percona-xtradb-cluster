@@ -39,19 +39,45 @@ DISRUPTIVE: frozenset[str] = frozenset(
 )
 
 # How a lever's restore value is applied. Each entry maps a lever to the SQL
-# template used to put the server back.
-RESTORE_SQL: dict[str, str] = {
-    "gmcast_isolate": "SET GLOBAL wsrep_provider_options = 'gmcast.isolate={value}'",
-    "pc_weight": "SET GLOBAL wsrep_provider_options = 'pc.weight={value}'",
-    "desync_cycle": "SET GLOBAL wsrep_desync = {value}",
-    "maint_mode_cycle": "SET GLOBAL pxc_maint_mode = {value}",
-    "strict_mode_window": "SET GLOBAL pxc_strict_mode = {value}",
-    "ws_size_squeeze": "SET GLOBAL wsrep_max_ws_size = {value}",
-    "applier_resize": "SET GLOBAL wsrep_applier_threads = {value}",
-    "backup_lock": "SELECT 1 /* backup lock is session-scoped; nothing to restore */",
-    "cluster_address_reset": "SELECT 1 /* rejoin is self-healing; nothing to restore */",
-    "graceful_shutdown": "SELECT 1 /* supervisor restarts the node; nothing to restore */",
+# templates used to put the server back, applied in order.
+RESTORE_SQL: dict[str, tuple[str, ...]] = {
+    "gmcast_isolate": ("SET GLOBAL wsrep_provider_options = 'gmcast.isolate={value}'",),
+    "pc_weight": ("SET GLOBAL wsrep_provider_options = 'pc.weight={value}'",),
+    "desync_cycle": ("SET GLOBAL wsrep_desync = {value}",),
+    "maint_mode_cycle": ("SET GLOBAL pxc_maint_mode = {value}",),
+    # Two statements, and the order is load-bearing in both directions.
+    # sql_require_primary_key=OFF is rejected outright while pxc_strict_mode is
+    # ENFORCING (sql/sys_vars.cc), so the strict mode must move first; and
+    # raising it to ENFORCING force-sets the GLOBAL sql_require_primary_key
+    # back to ON anyway (sql/wsrep_var.cc pxc_strict_mode_update), so the
+    # second statement is a no-op on the restore path rather than a
+    # correction. It is written out regardless: a restore that depends on
+    # another variable's side effect is one refactor away from silently
+    # leaving PK enforcement off for the rest of the run.
+    "strict_mode_window": (
+        "SET GLOBAL pxc_strict_mode = {value}",
+        "SET GLOBAL sql_require_primary_key = {require_pk}",
+    ),
+    "ws_size_squeeze": ("SET GLOBAL wsrep_max_ws_size = {value}",),
+    "applier_resize": ("SET GLOBAL wsrep_applier_threads = {value}",),
+    "backup_lock": ("SELECT 1 /* backup lock is session-scoped; nothing to restore */",),
+    "cluster_address_reset": ("SELECT 1 /* rejoin is self-healing; nothing to restore */",),
+    "graceful_shutdown": ("SELECT 1 /* supervisor restarts the node; nothing to restore */",),
 }
+
+
+def _restore_statements(lever: str, value: str) -> list[str] | None:
+    """The SQL that puts `lever` back to `value`, or None if there is none.
+
+    `require_pk` is derived rather than stored so that the lease rows written
+    by earlier code -- which carry only the pxc_strict_mode value -- keep
+    restoring correctly.
+    """
+    templates = RESTORE_SQL.get(lever)
+    if templates is None:
+        return None
+    require_pk = "OFF" if str(value).upper() in ("DISABLED", "PERMISSIVE") else "ON"
+    return [t.format(value=value, require_pk=require_pk) for t in templates]
 
 
 # Levers that are applied to EVERY node, so recovery must restore every node
@@ -61,41 +87,39 @@ RESTORE_SQL: dict[str, str] = {
 CLUSTER_WIDE: frozenset[str] = frozenset({"strict_mode_window"})
 
 
-def _apply_restore(lever: str, node: str, value: str) -> bool:
-    template = RESTORE_SQL.get(lever)
-    if template is None:
-        return True
-
-    if lever in CLUSTER_WIDE:
-        ok = True
-        for _, host in config.NODES:
-            conn = db.connect_with_retry(host, attempts=2)
-            if conn is None:
-                ok = False
-                continue
-            try:
-                with conn.cursor() as cur:
-                    cur.execute(template.format(value=value))
-            except Exception:  # noqa: BLE001 - retried next repair pass
-                ok = False
-            finally:
-                db.close_quietly(conn)
-        return ok
-
-    host = config.NODE_HOSTS.get(node)
-    if host is None:
-        return True
+def _restore_on_host(host: str, statements: list[str]) -> bool:
     conn = db.connect_with_retry(host, attempts=2)
     if conn is None:
         return False
     try:
         with conn.cursor() as cur:
-            cur.execute(template.format(value=value))
+            for stmt in statements:
+                cur.execute(stmt)
         return True
     except Exception:  # noqa: BLE001 - retried on the next repair pass
         return False
     finally:
         db.close_quietly(conn)
+
+
+def _apply_restore(lever: str, node: str, value: str) -> bool:
+    statements = _restore_statements(lever, value)
+    if statements is None:
+        return True
+
+    if lever in CLUSTER_WIDE:
+        # Every node, and a partial restore keeps the lease so the next repair
+        # pass retries the ones that were unreachable.
+        ok = True
+        for _, host in config.NODES:
+            if not _restore_on_host(host, statements):
+                ok = False
+        return ok
+
+    host = config.NODE_HOSTS.get(node)
+    if host is None:
+        return True
+    return _restore_on_host(host, statements)
 
 
 def repair_expired(jr, *, force_all: bool = False) -> list[dict[str, object]]:
