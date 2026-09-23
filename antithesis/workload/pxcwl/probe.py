@@ -42,6 +42,32 @@ def _progress_row(jr, node: str) -> dict:
     return dict(row)
 
 
+def _claim_error_log(conn, node: str, claimed: set[str]) -> None:
+    """Fire the reach claims that a STILL-LIVE node's own error log backs.
+
+    Deduplicated by CLAIM, not by pattern: two patterns feed the failed-transfer
+    claim, and a node hitting both would otherwise report the same reach twice.
+    One-shot per node per invocation for the same reason -- a reach claim says
+    the state was entered at least once, so re-firing it every few seconds for
+    as long as the line sits in the ring buffer is noise, not information.
+    """
+    claims = {
+        "sst_failed": ("failed_transfer", oracles.saw_failed_state_transfer),
+        "sst_process_error": ("failed_transfer", oracles.saw_failed_state_transfer),
+        "ist_fallback": ("ist_fallback", oracles.saw_ist_fallback),
+        "inconsistency": ("inconsistent", oracles.saw_inconsistency_verdict),
+    }
+    if all(f"{node}:{key}" in claimed for key, _ in claims.values()):
+        return
+    for pattern, line in db.error_log_matches(conn).items():
+        key, fire = claims[pattern]
+        tag = f"{node}:{key}"
+        if tag in claimed:
+            continue
+        claimed.add(tag)
+        fire({"node": node, "pattern": pattern, "log_line": line})
+
+
 # Probe outcomes. "no_schema" is deliberately distinct from "failed": it means
 # we could not even address the workload schema, which says nothing about
 # whether the node can commit.
@@ -115,9 +141,14 @@ def _run() -> int:
         leases.repair_expired(jr)
         deadline = time.time() + config.PROBE_WALL_BUDGET_SECONDS
         saw_small_cluster = False
+        # Reach claims already made this invocation, as "node:pattern".
+        claimed: set[str] = set()
+        iteration = 0
 
         while time.time() < deadline:
             now = time.time()
+            iteration += 1
+            scan_logs = iteration % config.ERROR_LOG_SCAN_EVERY == 1
             states = db.cluster_status()
 
             # ---------------------------------------------------- membership
@@ -221,6 +252,13 @@ def _run() -> int:
                         maint = db.global_vars(conn, ["pxc_maint_mode"]).get("pxc_maint_mode")
                     except Exception:  # noqa: BLE001
                         maint = None
+                    try:
+                        # A node still answering queries is exactly the case the
+                        # supervisor's death-time log scan cannot reach.
+                        if scan_logs:
+                            _claim_error_log(conn, name, claimed)
+                    except Exception:  # noqa: BLE001 - never fail a probe on this
+                        pass
                     finally:
                         db.close_quietly(conn)
 

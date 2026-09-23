@@ -230,6 +230,51 @@ def global_vars(conn, names: list[str]) -> dict[str, str]:
         return {row[0].lower(): row[1] for row in cur.fetchall()}
 
 
+# Error-log patterns the workload watches for on a node that is STILL ALIVE.
+# The supervisor scans the on-disk log when mysqld dies; it cannot report on a
+# node that logged one of these and then kept serving. That surviving case is
+# what this covers, and it is the more interesting half: it is the difference
+# between PXC degrading and PXC dying.
+ERROR_LOG_PATTERNS: dict[str, str] = {
+    # "SST failed:" with the colon, NOT "%SST failed%": the graceful code-11
+    # line reads "SST failed before wiping out the data directory", so the
+    # loose pattern fires the failure claim on the recovery path.
+    "sst_failed": "%SST failed:%",
+    "sst_process_error": "%Process completed with error: wsrep_sst%",
+    "ist_fallback": "%Saving node state to retry with IST%",
+    "inconsistency": "%Inconsistency detected%",
+}
+
+
+def error_log_matches(conn) -> dict[str, str]:
+    """Which watched patterns appear in this server instance's error log.
+
+    Reads performance_schema.error_log, which my.cnf enables on purpose
+    (log_output=FILE plus a real log-error path). Two properties of that table
+    shape everything here: it is an in-memory ring buffer, so it holds only the
+    CURRENT mysqld instance and is empty again after a restart; and it is
+    bounded, so an old event ages out. Both mean absence is never evidence --
+    these can only ever back reach claims, never an Always.
+
+    Returns {key: most recent matching line}, missing keys where nothing hit.
+    """
+    found: dict[str, str] = {}
+    for key, like in ERROR_LOG_PATTERNS.items():
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT DATA FROM performance_schema.error_log "
+                    "WHERE DATA LIKE %s ORDER BY LOGGED DESC LIMIT 1",
+                    (like,),
+                )
+                row = cur.fetchone()
+        except Exception:  # noqa: BLE001 - a node that cannot answer says nothing
+            continue
+        if row and row[0]:
+            found[key] = str(row[0])[:300]
+    return found
+
+
 def node_status(host: str) -> dict[str, str] | None:
     """wsrep status of one node, or None if unreachable (reason in LAST_ERROR)."""
     conn = connect_with_retry(host, attempts=1)

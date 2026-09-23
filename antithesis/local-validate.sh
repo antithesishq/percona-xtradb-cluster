@@ -250,17 +250,6 @@ cat <<'LAYOUT'
 
       sed -n '/^----- BEGIN cmd:seed /,/^----- END cmd:seed /p' LOG \
         | grep -vE '^[A-Za-z0-9_.-]+[[:space:]]*\|[[:space:]]'
-LAYOUT'
-  Sections      lines starting '===== [hh:mm:ssZ] name ====='
-  Commands      '----- BEGIN <label> [ts] -----' .. '----- END <label> rc=N [ts] -----'
-                Labels prefixed cmd: are test commands and set the exit status;
-                the rest are diagnostics and do not.
-  Container     lines prefixed '<service> | <rfc3339> ...', streamed in as they
-                output      happen -- so they DO appear inside command blocks.
-                That is deliberate: it is how you see which command provoked a
-                node error. To recover a command's own output alone:
-                  sed -n '/BEGIN cmd:seed /,/END cmd:seed /p' LOG \
-                    | grep -vE '^[A-Za-z0-9_.-]+[[:space:]]*\|[[:space:]]'
 LAYOUT
 
 section "bring up the cluster"

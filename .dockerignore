@@ -47,3 +47,11 @@ CMakeFiles/
 # pxc-src stage would otherwise carry it into /src and every edit here would
 # invalidate the entire compile — the exact problem pxc-src exists to prevent.
 .dockerignore
+
+# Same reasoning as .dockerignore above, and the same trap: .gitignore sits at
+# the context root, OUTSIDE antithesis/, so pxc-src does NOT strip it and it
+# lands in /src. Editing it therefore changes the tree handed to pxc-build and
+# invalidates the entire galera + server compile. That is not hypothetical --
+# this workflow edits it (the `local-validate**.log` entry was added for
+# exactly the log files *.log above excludes). No build step reads it.
+.gitignore

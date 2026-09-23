@@ -17,7 +17,7 @@ the checksum set stays comparable while DDL runs against it.
 
 from __future__ import annotations
 
-from . import config, db, oracles, rnd
+from . import config, db, oracles, rnd, schema
 
 SCHEMA = config.SCHEMA
 
@@ -107,9 +107,13 @@ def ddl_online_fk(jr, s, profile: dict) -> None:
         return
 
     if rnd.chance(0.5):
+        # `pref`, not `sid`. sid is BIGINT UNSIGNED and wl_fk_parent.pid is
+        # INT; MySQL requires the two ends of a foreign key to match in width
+        # and signedness, so the sid form was rejected errno 3780 every time
+        # it was drawn and this whole repro family never once executed.
         stmt = (
             f"ALTER TABLE `{SCHEMA}`.`{child}` ADD CONSTRAINT `{name}` "
-            f"FOREIGN KEY (sid) REFERENCES `{SCHEMA}`.`wl_fk_parent` (pid) "
+            f"FOREIGN KEY (pref) REFERENCES `{SCHEMA}`.`wl_fk_parent` (pid) "
             "ON DELETE CASCADE ON UPDATE CASCADE, ALGORITHM=INPLACE"
         )
     else:
@@ -144,19 +148,26 @@ def ddl_rename_swap(jr, s, profile: dict) -> None:
 
 
 def ddl_create_drop(jr, s, profile: dict) -> None:
-    """Create and drop from the fixed pool only.
+    """Create and drop ONE dedicated table, never the shared pool.
 
-    A fixed name pool keeps the schema namespace finite, which is what lets the
-    terminal oracle enumerate what should exist. Note there is no
-    CREATE TABLE ... SELECT here: enforce_gtid_consistency=ON forbids it.
+    The shape exists to put CREATE TABLE and DROP TABLE through TOI, and one
+    table does that as well as four. Pointing it at config.SCRATCH_TABLES did
+    something else as a side effect: the coin flip random-walked the pool, so
+    roughly half the time a given scratch table did not exist, and the five
+    other DDL shapes -- which all target that pool -- failed ER_NO_SUCH_TABLE
+    instead of exercising what they were written for. Neither branch here can
+    report the damage, because IF EXISTS and IF NOT EXISTS both always succeed.
+
+    See config.EPHEMERAL_TABLE for why the resulting inconsistency votes were
+    worse than merely wasteful.
+
+    Note there is no CREATE TABLE ... SELECT: enforce_gtid_consistency=ON
+    forbids it.
     """
-    table = rnd.choice(config.SCRATCH_TABLES)
+    table = config.EPHEMERAL_TABLE
     if rnd.chance(0.5):
-        stmt = (
-            f"CREATE TABLE IF NOT EXISTS `{SCHEMA}`.`{table}` "
-            "(sid BIGINT UNSIGNED NOT NULL, v BIGINT NOT NULL DEFAULT 0, "
-            "PRIMARY KEY (sid)) ENGINE=InnoDB"
-        )
+        # One definition, shared with the seeded pool, so the two cannot drift.
+        stmt = schema.scratch_ddl(table, qualify=True)
     else:
         stmt = f"DROP TABLE IF EXISTS `{SCHEMA}`.`{table}`"
     _run_ddl(jr, s, stmt, "ddl_create_drop")

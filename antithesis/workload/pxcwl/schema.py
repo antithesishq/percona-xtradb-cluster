@@ -40,9 +40,21 @@ from . import config
 
 SCHEMA = config.SCHEMA
 
-_SCRATCH_DDL = """CREATE TABLE IF NOT EXISTS `{name}` (
-  sid BIGINT UNSIGNED NOT NULL,
-  v   BIGINT NOT NULL DEFAULT 0,
+# Public and parameterised by name, so ddl.py's create/drop shape builds its
+# ephemeral table from this one definition instead of carrying its own copy.
+# Two hand-synchronised copies of the same CREATE is a drift waiting to happen.
+#
+# `pref` exists solely as an FK-legal reference to wl_fk_parent.pid. It cannot
+# be `sid`: that is BIGINT UNSIGNED and pid is INT, and MySQL requires the
+# referencing and referenced columns to match in both width and signedness --
+# so ddl_online_fk's ADD CONSTRAINT failed errno 3780 on every single attempt,
+# and its DROP branch then failed 1091 against a constraint that had never been
+# created. Nullable on purpose: existing rows predate the column, and a NULL
+# child value satisfies a foreign key.
+SCRATCH_DDL = """CREATE TABLE IF NOT EXISTS {ident} (
+  sid  BIGINT UNSIGNED NOT NULL,
+  v    BIGINT NOT NULL DEFAULT 0,
+  pref INT NULL,
   PRIMARY KEY (sid)
 ) ENGINE=InnoDB"""
 
@@ -125,6 +137,16 @@ NOPK_DDL = """CREATE TABLE IF NOT EXISTS `wl_nopk` (
        ) ENGINE=InnoDB"""
 
 
+def scratch_ddl(name: str, *, qualify: bool = False) -> str:
+    """The CREATE for one scratch-shaped table.
+
+    Qualify when the caller has no USE in effect -- ddl.py fully qualifies
+    every statement it emits, create_all does not.
+    """
+    ident = f"`{SCHEMA}`.`{name}`" if qualify else f"`{name}`"
+    return SCRATCH_DDL.format(ident=ident)
+
+
 def create_all(conn) -> None:
     """Every table except `wl_nopk`. See create_nopk for that one."""
     with conn.cursor() as cur:
@@ -133,7 +155,7 @@ def create_all(conn) -> None:
         for ddl in WORKLOAD_TABLES:
             cur.execute(ddl)
         for name in config.SCRATCH_TABLES:
-            cur.execute(_SCRATCH_DDL.format(name=name))
+            cur.execute(scratch_ddl(name))
 
 
 def create_nopk(conn) -> None:

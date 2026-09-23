@@ -184,6 +184,36 @@ def saw_state_transfer(details: Details) -> None:
     reachable("a state transfer was served to a joining node", details)
 
 
+def saw_failed_state_transfer(details: Details) -> None:
+    """The failure side of the transfer path.
+
+    ``saw_state_transfer`` only ever fires on success, so without this the
+    report cannot distinguish "SST worked every time" from "SST failed and the
+    node died before anyone asked".
+    """
+    reachable("a state transfer failed on a node that kept serving", details)
+
+
+def saw_ist_fallback(details: Details) -> None:
+    """The graceful arm of a failed SST: code 11, datadir intact, retry by IST.
+
+    Held apart from the plain failure claim because these are opposite
+    outcomes. Folding them together would let the good path mask the bad one.
+    """
+    reachable(
+        "a failed state transfer fell back to IST instead of killing the node", details
+    )
+
+
+def saw_inconsistency_verdict(details: Details) -> None:
+    """A node the cluster (or the node itself) judged inconsistent, still up.
+
+    Attribution for the terminal liveness oracles: when reconvergence goes red,
+    this says whether an inconsistency verdict is why.
+    """
+    reachable("a node was declared inconsistent and was still serving", details)
+
+
 # ==========================================================================
 # In-flight checkers and reach claims. Reached from parallel_driver_.
 # ==========================================================================

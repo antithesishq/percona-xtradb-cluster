@@ -39,6 +39,10 @@ JOURNAL_PATH = os.path.join(JOURNAL_DIR, "pxc.sqlite3")
 TRAFFIC_WALL_BUDGET_SECONDS = float(os.environ.get("PXC_TRAFFIC_BUDGET", "100"))
 PROBE_WALL_BUDGET_SECONDS = float(os.environ.get("PXC_PROBE_BUDGET", "90"))
 PROBE_INTERVAL_SECONDS = float(os.environ.get("PXC_PROBE_INTERVAL", "3"))
+# Scan a live node's error log every Nth probe iteration, not every one: five
+# LIKE queries per node per pass is real load, and performance_schema.error_log
+# is a ring buffer that holds an event for far longer than one interval.
+ERROR_LOG_SCAN_EVERY = int(os.environ.get("PXC_ERROR_LOG_SCAN_EVERY", "5"))
 VERIFY_BUDGET_SECONDS = float(os.environ.get("PXC_VERIFY_BUDGET", "600"))
 
 # --------------------------------------------------------------------------
@@ -100,8 +104,26 @@ CHECKSUM_TABLES: list[str] = [
 NOPK_TABLE = "wl_nopk"
 
 # DDL targets. A fixed pool keeps the schema namespace finite and enumerable,
-# so "no DDL residue after reconvergence" is a decidable question.
+# so "no DDL residue after reconvergence" is a decidable question. Seeded once
+# and never dropped: every other DDL shape needs these to be there.
 SCRATCH_TABLES: list[str] = [f"wl_scratch_{i}" for i in range(4)]
+
+# The ONLY table ddl_create_drop touches. Held apart from SCRATCH_TABLES
+# deliberately. When create/drop random-walked the shared pool, the pool spent
+# roughly half its time half-missing and every other DDL shape failed
+# ER_NO_SUCH_TABLE against it -- measured at 632 of 1428 DDL episodes in one
+# four-minute local run, with an inconsistency vote burned on each.
+#
+# That is not harmless noise. property-catalog.md's "un-injected-vote rule"
+# makes any inconsistency vote not attributable to injected sabotage count as
+# evidence of divergence, so ambient harness-made votes destroy the signal the
+# terminal checksum oracle depends on. Real vote coverage comes from the
+# sabotage-fenced variant, where the disagreement is deliberate.
+#
+# Nothing seeds this table: create_drop's own IF NOT EXISTS / IF EXISTS pair
+# owns its whole lifecycle, and compare_table_set enumerates the schema, so it
+# still gets cross-node agreement checked for free.
+EPHEMERAL_TABLE = "wl_scratch_ephemeral"
 
 # wl_bulk holds a bounded ring of large blobs; without the bound, container
 # disk (there are no volumes) fills up.
