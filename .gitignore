@@ -34,3 +34,4 @@ scalability_jobs_*
 .settings/
 .idea
 
+local-validate**.log
