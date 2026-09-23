@@ -57,6 +57,13 @@ MYSQLD_PID_FILE="${STATE_DIR}/mysqld.pid"
 MYSQLD_PID=""
 SHUTTING_DOWN=0
 BOOT_COUNT=0
+# Error log line count at the start of the current boot, so a death is judged
+# only on the log this boot produced.
+BOOT_LOG_OFFSET=0
+EXIT_STATUS=0
+EXIT_KIND=""
+EXIT_SIGNAL=0
+EXIT_FIELD_RESTART=""
 
 mkdir -p "${STATE_DIR}" "${NODE_CNF_DIR}" "$(dirname "${LOG_ERROR}")"
 
@@ -82,6 +89,66 @@ emit() {
 }
 
 log() { printf '[supervisor] %s\n' "$*"; }
+
+# ---------------------------------------------------------------------------
+# Antithesis SDK emission (fallback SDK)
+#
+# The supervisor is the ONLY component that observes how mysqld died. The
+# workload cannot: a dead node answers no queries, and performance_schema.
+# error_log is an in-memory ring buffer that is lost on restart. So the death
+# classification has to become a property from here.
+#
+# There is no bash SDK, so this uses the fallback SDK: single-line JSON objects
+# written to $ANTITHESIS_OUTPUT_DIR/sdk.jsonl. Every assertion is written twice
+# — once at supervisor startup as a CATALOG DECLARATION (hit:false), and again
+# when it actually fires (hit:true). The declaration is what makes an unfired
+# claim reportable instead of silently absent, so the two must agree on id,
+# message and location.
+#
+# Ids are inline constant strings for the same reason they are in oracles.py:
+# a name built at run time is invisible to reporting. begin_line values are
+# stable nominal ids, not real line numbers — bash has no useful callsite.
+# ---------------------------------------------------------------------------
+SDK_FILE=""
+if [[ -n "${ANTITHESIS_OUTPUT_DIR:-}" ]]; then
+    SDK_FILE="${ANTITHESIS_OUTPUT_DIR}/sdk.jsonl"
+fi
+
+A_DIED_UNRESTARTABLE="a node died in a way the shipped systemd unit would not restart"
+A_DIED_UNRESTARTABLE_LINE=1
+
+A_DIED_IN_STARTUP="a node died before mysqld reached ready for connections"
+A_DIED_IN_STARTUP_LINE=2
+
+A_DIED_AFTER_SST_FAILURE="a node died in a boot whose state transfer had failed"
+A_DIED_AFTER_SST_FAILURE_LINE=3
+
+A_DIED_INCONSISTENT="a node died after the cluster declared it inconsistent"
+A_DIED_INCONSISTENT_LINE=4
+
+# Minimal JSON string escaping. The payload is one line of mysqld error log,
+# which routinely contains quotes, backslashes and stray control bytes.
+json_escape() {
+    printf '%s' "${1:-}" | LC_ALL=C tr -d '\000-\037' | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
+
+# $1 id/message  $2 nominal line  $3 hit (true|false)  $4 details JSON or ""
+sdk_reachable() {
+    local id="$1" line="$2" hit="$3" details="${4:-}"
+    [[ -n "${SDK_FILE}" ]] || return 0
+    mkdir -p "$(dirname "${SDK_FILE}")" 2>/dev/null || true
+    printf '{"antithesis_assert":{"hit":%s,"must_hit":true,"assert_type":"reachability","display_type":"Reachable","condition":%s,"id":"%s","message":"%s","location":{"class":"","function":"supervisor","file":"antithesis/pxc-node/entrypoint.sh","begin_line":%s,"begin_column":0}%s}}\n' \
+        "${hit}" "${hit}" "${id}" "${id}" "${line}" "${details:+,\"details\":${details}}" \
+        >> "${SDK_FILE}"
+}
+
+# Declare every assertion in the catalog. Runs once, before the restart loop.
+sdk_declare_catalog() {
+    sdk_reachable "${A_DIED_UNRESTARTABLE}"      "${A_DIED_UNRESTARTABLE_LINE}"      false
+    sdk_reachable "${A_DIED_IN_STARTUP}"         "${A_DIED_IN_STARTUP_LINE}"         false
+    sdk_reachable "${A_DIED_AFTER_SST_FAILURE}"  "${A_DIED_AFTER_SST_FAILURE_LINE}"  false
+    sdk_reachable "${A_DIED_INCONSISTENT}"       "${A_DIED_INCONSISTENT_LINE}"       false
+}
 
 # ---------------------------------------------------------------------------
 # Per-node config fragment
@@ -237,6 +304,9 @@ probe_grastate() {
 classify_exit() {
     local status="$1"
     local kind signal field_restart
+    # Also published as EXIT_KIND / EXIT_FIELD_RESTART so the SDK assertions
+    # below can key on the same verdict the JSONL records, rather than
+    # re-deriving it and risking the two disagreeing.
 
     if (( status > 128 )); then
         signal=$(( status - 128 ))
@@ -269,8 +339,77 @@ classify_exit() {
         kind="exit"
     fi
 
+    # Published as globals, NOT printed. The caller used to run this inside a
+    # command substitution, which is a subshell — anything assigned there is
+    # discarded. exit_json() renders the JSONL fragment from these instead, so
+    # the JSONL record and the SDK assertions cannot disagree about the verdict.
+    EXIT_STATUS="${status}"
+    EXIT_KIND="${kind}"
+    EXIT_SIGNAL="${signal}"
+    EXIT_FIELD_RESTART="${field_restart}"
+}
+
+# Render the classification for emit(). Safe in a subshell: reads only.
+exit_json() {
     printf '"status":%d,"kind":"%s","signal":%d,"field_would_restart":%s' \
-        "${status}" "${kind}" "${signal}" "${field_restart}"
+        "${EXIT_STATUS}" "${EXIT_KIND}" "${EXIT_SIGNAL}" "${EXIT_FIELD_RESTART}"
+}
+
+# ---------------------------------------------------------------------------
+# Boot-scoped error log scan.
+#
+# Read once per death, from the line the error log was at when this boot
+# started, so evidence from earlier boots cannot leak into this verdict.
+# Everything fragile (the pattern list) feeds DETAILS; the only thing a pattern
+# decides on its own is a reach claim, never a pass/fail verdict.
+# ---------------------------------------------------------------------------
+boot_log_slice() {
+    tail -n +$(( BOOT_LOG_OFFSET + 1 )) "${LOG_ERROR}" 2>/dev/null
+}
+
+# Emit the death-class assertions for the boot that just ended.
+assert_death_class() {
+    local status="$1"
+    local slice reached_ready sst_failed inconsistent last_error details
+
+    # A graceful SQL SHUTDOWN is the workload's own lever, not a death.
+    [[ "${EXIT_KIND}" == "graceful" ]] && return 0
+
+    slice="$(boot_log_slice)"
+
+    reached_ready=false
+    grep -qF 'ready for connections' <<< "${slice}" && reached_ready=true
+
+    sst_failed=false
+    grep -qE 'SST failed|Process completed with error: wsrep_sst' <<< "${slice}" && sst_failed=true
+
+    # Both verdict forms: "Inconsistent by consensus" (the cluster voted against
+    # this node) and "Could not reach consensus" (the vote itself failed and the
+    # node assumed the worst about itself).
+    inconsistent=false
+    grep -qF 'Inconsistency detected' <<< "${slice}" && inconsistent=true
+
+    # The last ERROR-level line of the boot: whatever diagnostic an operator
+    # would actually have to work with. Empty means mysqld died silently.
+    last_error="$(grep -F '[ERROR]' <<< "${slice}" | tail -n 1 | cut -c1-300)"
+
+    details="$(printf '{"node":"%s","boot":%d,"kind":"%s","status":%d,"field_would_restart":%s,"reached_ready":%s,"sst_failed":%s,"inconsistent":%s,"last_error":"%s"}' \
+        "${PXC_NODE_NAME}" "${BOOT_COUNT}" "${EXIT_KIND}" "${status}" \
+        "${EXIT_FIELD_RESTART}" "${reached_ready}" "${sst_failed}" "${inconsistent}" \
+        "$(json_escape "${last_error}")")"
+
+    if [[ "${EXIT_FIELD_RESTART}" == "false" ]]; then
+        sdk_reachable "${A_DIED_UNRESTARTABLE}" "${A_DIED_UNRESTARTABLE_LINE}" true "${details}"
+    fi
+    if [[ "${reached_ready}" == "false" ]]; then
+        sdk_reachable "${A_DIED_IN_STARTUP}" "${A_DIED_IN_STARTUP_LINE}" true "${details}"
+    fi
+    if [[ "${sst_failed}" == "true" ]]; then
+        sdk_reachable "${A_DIED_AFTER_SST_FAILURE}" "${A_DIED_AFTER_SST_FAILURE_LINE}" true "${details}"
+    fi
+    if [[ "${inconsistent}" == "true" ]]; then
+        sdk_reachable "${A_DIED_INCONSISTENT}" "${A_DIED_INCONSISTENT_LINE}" true "${details}"
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -370,6 +509,8 @@ chown mysql:mysql "${LOG_ERROR}" 2>/dev/null || true
 tail -n +1 -F "${LOG_ERROR}" 2>/dev/null &
 LOG_TAIL_PID=$!
 
+sdk_declare_catalog
+
 while :; do
     BOOT_COUNT=$(( BOOT_COUNT + 1 ))
 
@@ -385,6 +526,7 @@ while :; do
         emit "hold_down_cleared"
     fi
 
+    BOOT_LOG_OFFSET=$(wc -l < "${LOG_ERROR}" 2>/dev/null || echo 0)
     emit "boot_start"
     probe_grastate
 
@@ -431,7 +573,9 @@ while :; do
     rm -f "${MYSQLD_PID_FILE}"
     MYSQLD_PID=""
 
-    emit "mysqld_exited" "$(classify_exit "${STATUS}")"
+    classify_exit "${STATUS}"
+    emit "mysqld_exited" "$(exit_json)"
+    assert_death_class "${STATUS}"
     log "mysqld exited with status ${STATUS}"
 
     probe_grastate

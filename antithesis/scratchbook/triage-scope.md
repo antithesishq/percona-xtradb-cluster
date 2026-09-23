@@ -88,8 +88,36 @@ run `2af893bc...-63-0` has 79 such records (one history reached `boot: 9`) on to
 of its 119 signal deaths. The shipped systemd unit does not restart status 1, so
 in the field these nodes stay down permanently — the worse outcome of the two.
 
-Always tally both classes. Grep the supervisor JSONL for `"kind":"unireg_abort"`;
-do not read a green crash property as "no nodes died".
+**Covered as of 2026-09-23.** The supervisor now emits fallback-SDK assertions
+to `$ANTITHESIS_OUTPUT_DIR/sdk.jsonl` (declared in the catalog at startup, so an
+unfired claim still reports):
+
+| Claim | Fires when |
+| --- | --- |
+| `a node died in a way the shipped systemd unit would not restart` | any non-graceful exit with `field_would_restart:false` |
+| `a node died before mysqld reached ready for connections` | the boot never logged "ready for connections" |
+| `a node died in a boot whose state transfer had failed` | the boot's log slice shows an SST failure |
+| `a node died after the cluster declared it inconsistent` | the boot's log slice shows `Inconsistency detected` |
+
+All four carry `node`, `boot`, `kind`, `status`, `field_would_restart`,
+`reached_ready`, `sst_failed`, `inconsistent` and `last_error` — the last being
+the final `[ERROR]` line of that boot, which is how you tell a diagnosed death
+from a silent one without a pattern list deciding the verdict.
+
+The surviving-node half is in the workload (`probe.py` `_claim_error_log`, via
+`performance_schema.error_log`): `a state transfer failed on a node that kept
+serving`, `a failed state transfer fell back to IST instead of killing the node`,
+and `a node was declared inconsistent and was still serving`. The two halves
+cover each other's blind spot — the supervisor cannot see a node that survives,
+and the workload cannot query one that died.
+
+**Still uncovered:** the cross-node case, where all three nodes declare
+themselves inconsistent at once. No single component observes it: the supervisor
+sees only its own node, and the workload usually cannot poll a node between its
+verdict and its death. It needs the per-node verdicts accumulated in the journal
+and asserted over a window. Until then it shows up as the terminal reconvergence
+reds plus three `a node died after the cluster declared it inconsistent` claims
+in the same history.
 
 ## Corollary for oracle (SDK property) failures
 
