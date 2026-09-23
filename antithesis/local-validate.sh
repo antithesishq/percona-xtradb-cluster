@@ -559,8 +559,12 @@ grep -oE "Error_code: MY-[0-9]+" "$clog" | sort -u | while read -r _ code; do
     grep -m1 "Error_code: $code" "$clog" | cut -c1-500 | sed 's/^/    /'
 done
 
-note "inconsistency voting rounds"
-grep -c "initiates vote on" "$clog"
+# Counted by DISTINCT writeset seqno, not by line. Every node logs "initiates
+# vote on <uuid>:<seqno>" for the same round, and logs it twice (the initial
+# vote and the recomputed one), so a bare grep -c reads 6x high -- it said 24
+# for a run that had 4 rounds, one per failing DDL statement.
+note "inconsistency voting rounds (distinct writesets)"
+grep -oE "initiates vote on [a-f0-9-]+:[0-9]+" "$clog" | sort -u | wc -l
 
 # Also split out. "Received NON-PRIMARY" was in this pattern and produced six
 # false evictions -- it is what every node logs on the way out of the primary
