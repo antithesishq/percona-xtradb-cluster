@@ -21,6 +21,7 @@ TAGS_sorted_by_file
 /GTAGS
 
 build/
+!antithesis/build/
 datatool/
 datatools/
 __pycache__/
