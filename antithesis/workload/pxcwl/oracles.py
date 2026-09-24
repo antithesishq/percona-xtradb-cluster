@@ -112,6 +112,22 @@ def cluster_reconverged(ok: bool, details: Details) -> None:
     )
 
 
+def saw_operator_bootstrap(details: Details) -> None:
+    """Terminal verification had to bootstrap a cluster with no Primary.
+
+    Attribution for cluster_reconverged, which is judged AFTER this recovery:
+    when it fires, the history reached a total loss of the Primary Component,
+    which Galera documents as needing an operator. Kept as a reach claim, not
+    a violation -- the claim is that the workload drives the cluster there,
+    and the details carry the per-node state for anyone checking whether a
+    given loss should have self-healed.
+    """
+    reachable(
+        "terminal verification bootstrapped a cluster that had lost its primary component",
+        details,
+    )
+
+
 def single_lineage(ok: bool, details: Details) -> None:
     """Kept separate from reconvergence on purpose: split-brain and
     never-recovered are completely different bugs and must not share a

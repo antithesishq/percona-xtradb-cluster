@@ -78,6 +78,9 @@ def _run() -> int:
                 session.demoted = True
                 jr.tally("session_demoted", None)
                 continue
+            for key, errno in session.posture_failed.items():
+                jr.tally(f"posture_rejected:{key}", errno)
+            session.posture_failed.clear()
 
             if cls == "ddl":
                 ddl.run_one(jr, session, profile)

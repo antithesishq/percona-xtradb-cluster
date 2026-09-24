@@ -139,3 +139,21 @@ workload design regardless: they are the general double-apply oracle.
   dummied on all nodes. Strictly serialized; no concurrent retry-vs-replay window.
 - Conclusion: RESOLVED — no race by construction; concern dropped. Unique-key markers
   retained as the generic double-apply detector.
+
+## Triage refinement (2026-09-24, run 5aa4afb557ee963d484ffea49f9a0ad4-63-0)
+
+- Found: "a cleanly failed write is absent from every Synced node" went red with 8
+  consecutive FAILED wids (inv 3, seq 1-8) present on all three nodes, with no faults
+  active. The details carried only wids, so the operation and errno were unrecoverable.
+  Separately, `CLEAN_REJECTIONS` included 1105, 1205 and 1317, all of which the wsrep
+  layer also returns for a failed COMMIT whose writeset may already have replicated
+  (`wsrep_override_error`, `sql/wsrep_thd.h:281-310`: e_interrupted → 1317,
+  e_timeout → 1205, default → 1105).
+- Conclusion: undecidable for this run; the classifier was over-broad either way.
+  Now: `journal.classify(..., at_commit=)` resolves `db.COMMIT_AMBIGUOUS` errnos from
+  the committing statement (explicit COMMIT/ROLLBACK, or an autocommit write) to
+  UNKNOWN; statement-time errors and 1213/1062 at COMMIT stay FAILED. The journal
+  errmsg is prefixed `[at_commit]`/`[statement]`, and `checks.reconcile` adds
+  `failed_present_evidence` / `missing_acked_evidence` (shape, node, errno, errmsg per
+  sampled wid). If the next red shows a 1213 or a client rollback, that is an in-scope
+  SUT finding.

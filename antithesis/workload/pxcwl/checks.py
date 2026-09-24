@@ -44,6 +44,167 @@ def wait_all_synced(deadline: float, poll: float = 3.0) -> dict[str, dict[str, s
     return last
 
 
+def _down(host: str) -> bool:
+    """Whether the last connect to ``host`` found nothing to talk to.
+
+    A refused connection means nothing is listening: mysqld is down or still
+    booting (a boot that cannot reach Primary aborts before it ever listens).
+    A name-resolution failure means the container itself is gone. A timeout
+    is NOT either -- a hung node may still be Primary -- so it never counts.
+    """
+    err = db.LAST_ERROR.get(host, "")
+    return any(
+        m in err
+        for m in (
+            "Connection refused",
+            "Errno 111",
+            "Name or service not known",
+            "Temporary failure in name resolution",
+            "Errno -2",
+            "Errno -3",
+        )
+    )
+
+
+def _last_committed(st: dict[str, str]) -> int | None:
+    try:
+        return int(st.get("wsrep_last_committed", "") or "")
+    except ValueError:
+        return None
+
+
+def _no_primary_anywhere(states: dict[str, dict[str, str] | None]) -> bool:
+    """Every node is provably outside a Primary Component.
+
+    Reachable nodes must report a non-Primary cluster status. A node that is
+    not reachable must be down, AND every reachable node must count it in its
+    own current (non-Primary) component -- ``wsrep_cluster_size`` equal to the
+    full cluster. That second half is what makes skipping it safe: a node
+    inside a non-Primary component cannot simultaneously be a Primary of its
+    own, whereas a down node outside it might be about to restore one from
+    gvwstate.dat.
+    """
+    reachable = {n: st for n, st in states.items() if st}
+    if not reachable:
+        return False
+    if any(st.get("wsrep_cluster_status", "").lower() == "primary" for st in reachable.values()):
+        return False
+    hosts = dict(config.NODES)
+    missing = [n for n, st in states.items() if not st]
+    if not all(_down(hosts[n]) for n in missing):
+        return False
+    if missing and not all(
+        st.get("wsrep_cluster_size", "") == str(config.EXPECTED_CLUSTER_SIZE)
+        for st in reachable.values()
+    ):
+        return False
+    return True
+
+
+def _ledger_high_water(jr) -> tuple[int | None, dict[str, int]]:
+    """Highest wsrep_last_committed the anytime_ probe ever saw, per node."""
+    try:
+        rows = jr.conn.execute("SELECT node, last_committed FROM progress").fetchall()
+    except Exception:  # noqa: BLE001
+        return None, {}
+    seen = {r["node"]: int(r["last_committed"]) for r in rows}
+    return (max(seen.values()) if seen else -1), seen
+
+
+def bootstrap_if_no_primary(jr, stable_for: float = 15.0) -> dict | None:
+    """Recover a cluster that has lost its Primary Component, as an operator would.
+
+    Galera does not recover from this on its own unless every member of the
+    last Primary view comes back -- which a gracefully restarted node, with a
+    new gcomm identity and no gvwstate.dat, never does. The documented
+    recovery is ``pc.bootstrap=YES`` on the most advanced node. Without this,
+    the reconvergence assertion measured "did the fault schedule happen to
+    avoid a total split" rather than anything about PXC: run 5aa4afb5-63-0
+    went red with node2 and node3 non-Primary for 600 quiet seconds.
+
+    Bootstrapping the wrong node is itself a manufactured finding -- a second
+    Primary, or a more advanced node SST'd back over its acknowledged writes
+    -- so every gate below errs toward doing nothing:
+
+      * no node may be Primary, and a down node is only skipped when the
+        reachable nodes count it inside their own non-Primary component
+        (``_no_primary_anywhere``), held across two samples ``stable_for``
+        apart so a remerge in progress is left alone, and re-checked
+        immediately before the SET;
+      * the chosen node must be at or beyond the highest commit the anytime_
+        probe ever observed on ANY node. Seqnos are one sequence within one
+        lineage, so a down node that was once seen further ahead blocks the
+        bootstrap outright. With no ledger at all, only a fully reachable
+        cluster -- where the comparison below is the whole truth -- qualifies.
+
+    Runs only after fault injection has stopped. Returns None when not
+    applicable, else what was decided and done.
+    """
+    first = db.cluster_status()
+    if not _no_primary_anywhere(first):
+        return None
+    time.sleep(stable_for)
+    states = db.cluster_status()
+    if not _no_primary_anywhere(states):
+        return None
+
+    candidates = {n: _last_committed(st) for n, st in states.items() if st}
+    candidates = {n: c for n, c in candidates.items() if c is not None}
+    high_water, seen = _ledger_high_water(jr)
+    all_reachable = all(states.get(n) for n, _ in config.NODES)
+    decision = {
+        "bootstrapped": False,
+        "node": None,
+        "last_committed": candidates,
+        "ledger_high_water": seen,
+        "cluster_status": {
+            n: (st or {}).get("wsrep_cluster_status") for n, st in states.items()
+        },
+        "local_state": {
+            n: (st or {}).get("wsrep_local_state_comment") for n, st in states.items()
+        },
+        "cluster_sizes": {n: (st or {}).get("wsrep_cluster_size") for n, st in states.items()},
+        "unreachable_reasons": {
+            n: db.LAST_ERROR.get(h) for n, h in config.NODES if not states.get(n)
+        },
+        "error": None,
+    }
+    if not candidates:
+        decision["error"] = "no reachable node reported wsrep_last_committed"
+        return decision
+
+    # Most advanced node; ties go to the first in config order, deterministically.
+    order = [n for n, _ in config.NODES]
+    chosen = max(candidates, key=lambda n: (candidates[n], -order.index(n)))
+    decision["node"] = chosen
+    if high_water is None and not all_reachable:
+        decision["error"] = "journal ledger unreadable and a node is down: cannot rule it ahead"
+        return decision
+    if high_water is not None and candidates[chosen] < high_water:
+        decision["error"] = "a node was once observed ahead of every reachable node"
+        return decision
+
+    host = dict(config.NODES)[chosen]
+    conn = db.connect_with_retry(host, attempts=2)
+    if conn is None:
+        decision["error"] = db.LAST_ERROR.get(host)
+        return decision
+    try:
+        # Last look: the sampling above took seconds, and a booting node can
+        # restore a Primary in that gap.
+        if not _no_primary_anywhere(db.cluster_status()):
+            decision["error"] = "a Primary appeared before the bootstrap was sent"
+            return decision
+        with conn.cursor() as cur:
+            cur.execute("SET GLOBAL wsrep_provider_options = 'pc.bootstrap=YES'")
+        decision["bootstrapped"] = True
+    except Exception as exc:  # noqa: BLE001
+        decision["error"] = str(exc)[:200]
+    finally:
+        db.close_quietly(conn)
+    return decision
+
+
 def wait_commit_cut_equal(deadline: float, poll: float = 2.0) -> tuple[bool, dict[str, int]]:
     """Wait for wsrep_last_committed to agree across nodes, twice running.
 
@@ -396,12 +557,49 @@ def reconcile(jr, conns: dict[str, object]) -> tuple[bool, bool, bool, dict]:
         "ack_counts": counts,
         "missing_acked_sample": missing_acked,
         "failed_present_sample": failed_present,
+        # What the journal recorded for each sampled discrepancy. Without it a
+        # red here cannot be classified at all: run 5aa4afb5-63-0 had 8 FAILED
+        # rows on every node and no way to tell which operation, errno or
+        # phase produced them.
+        "failed_present_evidence": _journal_evidence(jr, failed_present),
+        "missing_acked_evidence": _journal_evidence(jr, missing_acked),
         "unminted_sample": unminted,
         "unknown_rows_present_per_node": unknown_presence,
         "scan_errors": scan_errors,
         "nodes_fully_scanned": sorted(set(conns) - set(scan_errors)),
     }
     return (not missing_acked), (not failed_present), (not unminted), details
+
+
+def _journal_evidence(jr, samples: dict[str, list[int]]) -> dict[str, dict]:
+    """The journal rows behind a set of sampled wids, keyed by wid.
+
+    Best-effort: this only decorates details, so a journal read that fails
+    leaves the verdict alone and says so.
+    """
+    wids = sorted({w for ws in samples.values() for w in ws})
+    if not wids:
+        return {}
+    try:
+        placeholders = ",".join("?" * len(wids))
+        rows = jr.conn.execute(
+            "SELECT wid, inv_id, node, shape, state, errno, errmsg FROM ack "
+            f"WHERE wid IN ({placeholders})",
+            wids,
+        ).fetchall()
+    except Exception as exc:  # noqa: BLE001
+        return {"journal_read_error": {"error": str(exc)[:200]}}
+    return {
+        str(r["wid"]): {
+            "inv_id": r["inv_id"],
+            "node": r["node"],
+            "shape": r["shape"],
+            "state": r["state"],
+            "errno": r["errno"],
+            "errmsg": (r["errmsg"] or "")[:200],
+        }
+        for r in rows
+    }
 
 
 def counter_bounds(jr, conns: dict[str, object]) -> tuple[bool, bool, dict]:

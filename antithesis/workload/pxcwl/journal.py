@@ -408,7 +408,9 @@ class Journal:
             )
 
 
-def classify(exc: BaseException | None, conn) -> tuple[str, int | None, str | None]:
+def classify(
+    exc: BaseException | None, conn, *, at_commit: bool = False
+) -> tuple[str, int | None, str | None]:
     """Decide which of the three outcome states a finished write is in.
 
     The liveness probe is the discriminator, and it is what licenses treating a
@@ -418,16 +420,25 @@ def classify(exc: BaseException | None, conn) -> tuple[str, int | None, str | No
     dummy on every node), while the same transaction on a node that just died
     presents as a lost connection and lands in UNKNOWN instead. No timing logic
     is needed; the probe does the work.
+
+    ``at_commit`` says the error came from the statement that commits: an
+    explicit COMMIT, or an autocommit write, where the statement IS the commit.
+    There the errnos in ``db.COMMIT_AMBIGUOUS`` can arrive after the writeset
+    was replicated, so they resolve to UNKNOWN rather than FAILED.
     """
     if exc is None:
         return "ACKED", None, None
 
     errno = db.errno_of(exc)
-    msg = str(exc)[:500]
+    # The phase goes into the journal with the message, so a reconciler red
+    # can say whether the error came from the committing statement.
+    msg = ("[at_commit] " if at_commit else "[statement] ") + str(exc)[:480]
 
     if errno in (db.CR_SERVER_GONE_ERROR, db.CR_SERVER_LOST):
         return "UNKNOWN", errno, msg
     if isinstance(exc, (OSError, TimeoutError)):
+        return "UNKNOWN", errno, msg
+    if at_commit and errno in db.COMMIT_AMBIGUOUS:
         return "UNKNOWN", errno, msg
     if errno in db.CLEAN_REJECTIONS and db.is_alive(conn):
         return "FAILED", errno, msg

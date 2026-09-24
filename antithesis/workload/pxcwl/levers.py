@@ -18,6 +18,9 @@ finding rather than exploring one:
   NBO DDL          deterministically aborts a joiner
 
 The catalog fences all three into separate variants with a poison budget.
+(Terminal verification does use pc.bootstrap, but only as operator recovery
+once no node is Primary at all -- see checks.bootstrap_if_no_primary. With no
+Primary anywhere, there is no second component to split from.)
 """
 
 from __future__ import annotations
@@ -52,6 +55,17 @@ def _port_open(host: str, timeout: float = 2.0) -> bool:
         return False
 
 
+def _connected_and_synced(st: dict[str, str] | None) -> bool:
+    """Provider connected, node Synced, in a Primary component."""
+    if not st:
+        return False
+    return (
+        st.get("wsrep_connected", "").upper() == "ON"
+        and st.get("wsrep_local_state", "") == "4"
+        and st.get("wsrep_cluster_status", "").lower() == "primary"
+    )
+
+
 # ==========================================================================
 # Benign, per-node levers
 # ==========================================================================
@@ -64,6 +78,15 @@ def applier_resize(jr, s, profile: dict) -> None:
     extra thread is the receiver), paired with evidence that commits kept
     advancing -- a pool that reaches its size but stops applying is the
     interesting failure, not the one where the number is wrong.
+
+    Judged only on a node that stayed connected and Synced for the whole
+    window. With the provider disconnected, the SET is accepted and the
+    variable reads back the target, but wsrep_create_appliers returns without
+    starting a thread (sql/wsrep_thd.cc:122-132, logged as "Trying to launch
+    slave threads before creating connection"); the pool is rebuilt only on
+    the next successful connect (sql/wsrep_var.cc:570-581). A count of 0 there
+    is PXC working as designed. Run 5aa4afb5-63-0 judged exactly that: node3
+    left disconnected by a failed cluster_address_reset, target 8, count 0.
     """
     target = rnd.choice([1, 2, 4, 8, 16])
     if not leases.acquire(
@@ -73,6 +96,11 @@ def applier_resize(jr, s, profile: dict) -> None:
 
     before = db.node_status(s.host) or {}
     committed_before = int(before.get("wsrep_last_committed", "0") or 0)
+    if not _connected_and_synced(before):
+        # Not an experiment on the applier pool: there is no pool to resize.
+        leases.release(jr, "applier_resize", s.name, "4")
+        jr.tally("applier_resize_skipped_not_synced", None)
+        return
 
     if not _set_global(s.host, "SET GLOBAL wsrep_applier_threads = %s", (target,)):
         leases.release(jr, "applier_resize", s.name, "4")
@@ -83,6 +111,10 @@ def applier_resize(jr, s, profile: dict) -> None:
     observed: dict[str, str] = {}
     last_poll_ok = False
     setpoint_still_ours = False
+    # Any poll that saw the node disconnected or out of Synced invalidates the
+    # window: the pool rebuild on reconnect runs on its own schedule, which is
+    # not what the settle budget measures.
+    stayed_synced = True
 
     while time.time() < deadline:
         st = db.node_status(s.host)
@@ -92,6 +124,9 @@ def applier_resize(jr, s, profile: dict) -> None:
             continue
         observed = st
         last_poll_ok = True
+        if not _connected_and_synced(st):
+            stayed_synced = False
+            break
 
         # Confirm the setpoint is still the one we set. Another lever -- or a
         # node restart, which comes back at my.cnf's value -- can move it, and
@@ -125,15 +160,19 @@ def applier_resize(jr, s, profile: dict) -> None:
 
     committed_after = int(observed.get("wsrep_last_committed", "0") or 0)
 
-    # Judge only when the node was still answering on the LAST poll and the
-    # setpoint was still ours. Otherwise the window was invalidated by
-    # something other than resize convergence.
-    if last_poll_ok and setpoint_still_ours:
+    # Judge only when the node was still answering on the LAST poll, the
+    # setpoint was still ours, and no poll saw it disconnected or out of
+    # Synced. Otherwise the window was invalidated by something other than
+    # resize convergence.
+    if last_poll_ok and setpoint_still_ours and stayed_synced:
         oracles.applier_resize_converged(
             converged,
             {
                 "target": target,
                 "thread_count": observed.get("wsrep_thread_count"),
+                "wsrep_connected": observed.get("wsrep_connected"),
+                "local_state": observed.get("wsrep_local_state_comment"),
+                "cluster_status": observed.get("wsrep_cluster_status"),
                 "last_committed_delta": committed_after - committed_before,
                 "settle_budget_s": config.RESIZE_SETTLE_SECONDS,
                 "node": s.name,
@@ -429,7 +468,7 @@ def ws_size_squeeze(jr, s, profile: dict) -> None:
             exc = e
         from . import journal as _journal
 
-        state, errno, msg = _journal.classify(exc, s.conn)
+        state, errno, msg = _journal.classify(exc, s.conn, at_commit=True)
         jr.resolve([wid], state, errno=errno, errmsg=msg)
         jr.tally("ws_size_squeeze", errno)
     finally:

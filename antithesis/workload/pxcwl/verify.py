@@ -33,6 +33,12 @@ def run(mode: str) -> int:
         return 0
 
 
+def _all_synced(states: dict) -> bool:
+    return len(states) == config.EXPECTED_CLUSTER_SIZE and all(
+        db.is_synced(s) for s in states.values()
+    )
+
+
 def _run(mode: str) -> int:
     jr = journal.Journal("verify")
     try:
@@ -42,11 +48,22 @@ def _run(mode: str) -> int:
         # measuring the harness rather than PXC.
         repaired = leases.repair_expired(jr, force_all=True)
 
-        deadline = time.time() + config.VERIFY_BUDGET_SECONDS
-        states = checks.wait_all_synced(deadline)
+        started = time.time()
+        deadline = started + config.VERIFY_BUDGET_SECONDS
+        # First give the cluster a share of the budget to reconverge unaided.
+        # Only if it has not, and no node is Primary at all, is the operator
+        # recovery applied -- and the rest of the budget is then the bound on
+        # reconverging from it.
+        states = checks.wait_all_synced(started + config.VERIFY_BUDGET_SECONDS * 0.4)
+        bootstrap = None
+        if not _all_synced(states):
+            bootstrap = checks.bootstrap_if_no_primary(jr)
+            if bootstrap is not None and bootstrap["bootstrapped"]:
+                oracles.saw_operator_bootstrap({"mode": mode, **bootstrap})
+            states = checks.wait_all_synced(deadline)
 
         synced = {n: db.is_synced(s) for n, s in states.items()}
-        all_synced = len(states) == config.EXPECTED_CLUSTER_SIZE and all(synced.values())
+        all_synced = _all_synced(states)
         uuids = sorted(
             {
                 s.get("wsrep_local_state_uuid", "")
@@ -65,8 +82,12 @@ def _run(mode: str) -> int:
             "cluster_sizes": {
                 n: (s or {}).get("wsrep_cluster_size") for n, s in states.items()
             },
+            "cluster_status": {
+                n: (s or {}).get("wsrep_cluster_status") for n, s in states.items()
+            },
             "unreachable_reasons": dict(db.LAST_ERROR),
             "state_uuids": uuids,
+            "operator_bootstrap": bootstrap,
         }
 
         # Does the cluster come back at all?

@@ -49,6 +49,18 @@ CLEAN_REJECTIONS: frozenset[int] = frozenset(
     }
 )
 
+# Clean at STATEMENT time, ambiguous at COMMIT time. Each of these can also be
+# the wsrep layer's verdict on a COMMIT whose writeset was already replicated:
+# wsrep_override_error (sql/wsrep_thd.h:281-310) maps e_interrupted_error to
+# 1317, e_timeout_error to 1205, and every unlisted client_error to 1105. On a
+# live connection that still says nothing about whether the other nodes applied
+# the writeset, so a COMMIT that fails with one of these is UNKNOWN, not FAILED.
+# Run 5aa4afb5-63-0 had 8 FAILED rows present on every node, which is what an
+# over-broad FAILED class looks like from the reconciler.
+COMMIT_AMBIGUOUS: frozenset[int] = frozenset(
+    {ER_LOCK_WAIT_TIMEOUT, ER_QUERY_INTERRUPTED, ER_UNKNOWN_ERROR}
+)
+
 # Connection-level failures: the outcome of an in-flight COMMIT is unknowable.
 CR_SERVER_GONE_ERROR = 2006
 CR_SERVER_LOST = 2013
@@ -189,6 +201,7 @@ def schema_ddl_failure_is_environmental(conn, exc: BaseException) -> bool:
 
 WSREP_STATUS_NAMES = [
     "wsrep_ready",
+    "wsrep_connected",
     "wsrep_local_state",
     "wsrep_local_state_comment",
     "wsrep_cluster_status",

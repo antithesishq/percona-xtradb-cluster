@@ -175,3 +175,18 @@ None — all three resolved (see Investigation Log). Resolutions folded into the
 ## Synthesis refinement (2026-09-10)
 
 REFRAMED as a rider: a deterministic resize-loop test covers most of the value; only the settled-count convergence check is kept, as a rider on workloads that resize appliers anyway.
+
+## Triage refinement (2026-09-24, run 5aa4afb557ee963d484ffea49f9a0ad4-63-0)
+
+- Found: 33 counterexamples. The one examined (node3, target 8, `wsrep_thread_count` 0)
+  was a node whose provider was disconnected: a `cluster_address_reset` reconnect had
+  failed on `pc.wait_prim_timeout`, and the SET then logged "Trying to launch slave
+  threads before creating connection". `wsrep_slave_threads_update` →
+  `wsrep_create_appliers` returns early when `!wsrep_connected`
+  (`sql/wsrep_thd.cc:122-132`); the pool is rebuilt on the next successful connect
+  (`sql/wsrep_var.cc:570-581`). Working as designed.
+- Conclusion: harness false positive. `levers.applier_resize` now judges only a node that
+  was connected, Synced and Primary before the SET and on every poll of the settle window
+  (`wsrep_connected` added to `db.WSREP_STATUS_NAMES`). The details carry
+  `wsrep_connected`, local state and cluster status. Pinned by
+  `oracle-tests/test_triage_false_positives.py`.

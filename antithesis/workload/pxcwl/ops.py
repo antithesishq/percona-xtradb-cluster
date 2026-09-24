@@ -29,35 +29,57 @@ class Session:
         self.profile = profile
         self.conn = None
         self.demoted = False
+        # posture key -> errno of the rejected SET, filled by ensure().
+        self.posture_failed: dict[str, int | None] = {}
 
     def ensure(self) -> bool:
-        """Connect if needed and apply session posture. False if unreachable."""
+        """Connect if needed and apply session posture. False if unreachable.
+
+        Each SET is applied on its own. They used to share one ``try``, so the
+        first rejection silently skipped the rest -- and SERIALIZABLE, which
+        the swarm draws on purpose, is always rejected with 1105 under
+        pxc_strict_mode=ENFORCING (sql/sys_vars.cc:5446-5457). In run
+        5aa4afb5-63-0 that left every such timeline with wsrep_sync_wait and
+        the streaming-fragment settings unapplied while its profile said
+        otherwise. Rejections are kept in ``posture_failed`` for the driver to
+        tally, so the triage report shows which posture a timeline really ran.
+        """
         if self.conn is not None and db.is_alive(self.conn):
             return True
         db.close_quietly(self.conn)
         self.conn = db.connect_with_retry(self.host, SCHEMA)
         if self.conn is None:
             return False
-        try:
-            with self.conn.cursor() as cur:
-                cur.execute(
-                    "SET SESSION TRANSACTION ISOLATION LEVEL "
-                    + str(self.profile.get("isolation", "REPEATABLE READ"))
+        stmts: list[tuple[str, str, tuple]] = [
+            (
+                "isolation",
+                "SET SESSION TRANSACTION ISOLATION LEVEL "
+                + str(self.profile.get("isolation", "REPEATABLE READ")),
+                (),
+            ),
+            (
+                "sync_wait",
+                "SET SESSION wsrep_sync_wait = %s",
+                (int(self.profile.get("sync_wait_level", 0)),),
+            ),
+        ]
+        frag = int(self.profile.get("sr_fragment_size", 0))
+        if frag > 0:
+            stmts.append(
+                (
+                    "fragment_unit",
+                    "SET SESSION wsrep_trx_fragment_unit = %s",
+                    (str(self.profile.get("sr_fragment_unit", "bytes")),),
                 )
-                cur.execute(
-                    "SET SESSION wsrep_sync_wait = %s",
-                    (int(self.profile.get("sync_wait_level", 0)),),
-                )
-                frag = int(self.profile.get("sr_fragment_size", 0))
-                if frag > 0:
-                    cur.execute(
-                        "SET SESSION wsrep_trx_fragment_unit = %s",
-                        (str(self.profile.get("sr_fragment_unit", "bytes")),),
-                    )
-                    cur.execute("SET SESSION wsrep_trx_fragment_size = %s", (frag,))
-            return True
-        except Exception:  # noqa: BLE001 - posture is best-effort under faults
-            return self.conn is not None
+            )
+            stmts.append(("fragment_size", "SET SESSION wsrep_trx_fragment_size = %s", (frag,)))
+        for key, sql, params in stmts:
+            try:
+                with self.conn.cursor() as cur:
+                    cur.execute(sql, params)
+            except Exception as e:  # noqa: BLE001 - posture is best-effort under faults
+                self.posture_failed[key] = db.errno_of(e)
+        return self.conn is not None
 
     def close(self) -> None:
         db.close_quietly(self.conn)
@@ -82,11 +104,17 @@ def _rollback_quietly(conn) -> None:
         pass
 
 
-def _finish(jr, wids: list[int], shape: str, exc, conn) -> str:
-    """Resolve a transaction's journal rows and record the reach claims."""
+def _finish(jr, wids: list[int], shape: str, exc, conn, *, at_commit: bool) -> str:
+    """Resolve a transaction's journal rows and record the reach claims.
+
+    ``at_commit`` is required, never defaulted: whether the error came from the
+    committing statement decides whether a 1105/1205/1317 proves no trace (see
+    db.COMMIT_AMBIGUOUS), so every callsite has to say which it is. An
+    autocommit write passes True -- the statement is the commit.
+    """
     if exc is not None:
         _rollback_quietly(conn)
-    state, errno, msg = journal.classify(exc, conn)
+    state, errno, msg = journal.classify(exc, conn, at_commit=at_commit)
     jr.resolve(wids, state, errno=errno, errmsg=msg)
     jr.tally(shape, errno)
 
@@ -131,7 +159,7 @@ def insert_witness(jr, s: Session, profile: dict) -> None:
             )
     except Exception as e:  # noqa: BLE001
         exc = e
-    _finish(jr, [wid], "insert_witness", exc, s.conn)
+    _finish(jr, [wid], "insert_witness", exc, s.conn, at_commit=True)
 
 
 def insert_multirow(jr, s: Session, profile: dict) -> None:
@@ -143,6 +171,7 @@ def insert_multirow(jr, s: Session, profile: dict) -> None:
     wids = [jr.new_wid() for _ in range(n)]
     jr.attempt(wids, target="witness", node=s.name, shape="insert_multirow")
     exc = None
+    committing = False
     try:
         # Explicit transaction, not autocommit: the journal resolves all of
         # these wids to a single state, so their fate has to be all-or-nothing.
@@ -158,10 +187,11 @@ def insert_multirow(jr, s: Session, profile: dict) -> None:
                     for w in wids
                 ],
             )
+        committing = True
         s.conn.commit()
     except Exception as e:  # noqa: BLE001
         exc = e
-    _finish(jr, wids, "insert_multirow", exc, s.conn)
+    _finish(jr, wids, "insert_multirow", exc, s.conn, at_commit=committing)
 
 
 def txn_multi_statement(jr, s: Session, profile: dict) -> None:
@@ -176,6 +206,7 @@ def txn_multi_statement(jr, s: Session, profile: dict) -> None:
     wids: list[int] = []
     incr_ids: list[int] = []
     exc = None
+    committing = False
     committed_statements = 0
 
     try:
@@ -204,16 +235,18 @@ def txn_multi_statement(jr, s: Session, profile: dict) -> None:
                 committed_statements += 1
         if rnd.chance(0.1):
             # Explicit rollback is a first-class shape, not a failure.
+            committing = True
             s.conn.rollback()
             jr.resolve(wids, "FAILED", errno=None, errmsg="client rollback")
             jr.resolve_incrs(incr_ids, "FAILED")
             jr.tally("txn_rollback", None)
             return
+        committing = True
         s.conn.commit()
     except Exception as e:  # noqa: BLE001
         exc = e
 
-    state = _finish(jr, wids, "txn_multi_statement", exc, s.conn)
+    state = _finish(jr, wids, "txn_multi_statement", exc, s.conn, at_commit=committing)
     jr.resolve_incrs(incr_ids, state)
     if state == "ACKED" and committed_statements >= 100:
         oracles.saw_long_transaction(
@@ -238,7 +271,7 @@ def insert_autoinc(jr, s: Session, profile: dict) -> None:
             )
     except Exception as e:  # noqa: BLE001
         exc = e
-    _finish(jr, [wid], "insert_autoinc", exc, s.conn)
+    _finish(jr, [wid], "insert_autoinc", exc, s.conn, at_commit=True)
 
 
 # ==========================================================================
@@ -258,7 +291,7 @@ def update_hot_row(jr, s: Session, profile: dict) -> None:
         exc = e
     if exc is not None:
         _rollback_quietly(s.conn)
-    state, errno, msg = journal.classify(exc, s.conn)
+    state, errno, msg = journal.classify(exc, s.conn, at_commit=True)
     jr.resolve_incrs([incr_id], state)
     jr.tally("update_hot_row", errno)
     if errno == db.ER_LOCK_DEADLOCK:
@@ -272,6 +305,7 @@ def delete_reinsert(jr, s: Session, profile: dict) -> None:
     wid = jr.new_wid()
     jr.attempt([wid], target="witness", node=s.name, shape="delete_reinsert")
     exc = None
+    committing = False
     try:
         # One transaction: an insert that lands followed by a delete that fails
         # would otherwise leave a row behind while the journal calls the write
@@ -289,10 +323,11 @@ def delete_reinsert(jr, s: Session, profile: dict) -> None:
                 "VALUES (%s, %s, %s, %s, %s)",
                 (wid, f"inv{jr.inv_id}", s.name, wid & 0xFFFFFF, schema.payload_for(wid)),
             )
+        committing = True
         s.conn.commit()
     except Exception as e:  # noqa: BLE001
         exc = e
-    _finish(jr, [wid], "delete_reinsert", exc, s.conn)
+    _finish(jr, [wid], "delete_reinsert", exc, s.conn, at_commit=committing)
 
 
 def uk_churn(jr, s: Session, profile: dict) -> None:
@@ -306,7 +341,7 @@ def uk_churn(jr, s: Session, profile: dict) -> None:
             cur.execute("INSERT INTO `wl_uk` (id, u) VALUES (%s, %s)", (wid, u))
     except Exception as e:  # noqa: BLE001
         exc = e
-    _finish(jr, [wid], "uk_churn", exc, s.conn)
+    _finish(jr, [wid], "uk_churn", exc, s.conn, at_commit=True)
 
 
 def locking_read(jr, s: Session, profile: dict) -> None:
@@ -419,7 +454,7 @@ def fk_cascade_dml(jr, s: Session, profile: dict) -> None:
             )
     except Exception as e:  # noqa: BLE001
         exc = e
-    _finish(jr, [wid], "fk_cascade_dml", exc, s.conn)
+    _finish(jr, [wid], "fk_cascade_dml", exc, s.conn, at_commit=True)
 
 
 # ==========================================================================
@@ -447,7 +482,7 @@ def bulk_write(jr, s: Session, profile: dict) -> None:
             )
     except Exception as e:  # noqa: BLE001
         exc = e
-    state = _finish(jr, [wid], "bulk_write", exc, s.conn)
+    state = _finish(jr, [wid], "bulk_write", exc, s.conn, at_commit=True)
     if state == "ACKED" and size > 4 * 1024 * 1024:
         oracles.saw_large_writeset({"shape": "bulk_write", "bytes": size})
 
@@ -475,6 +510,10 @@ def sr_session(jr, s: Session, profile: dict) -> None:
     exc = None
     fragments_seen = 0
     rolled_back = False
+    # Set before the rollback arm too: fragments are already replicated, so a
+    # rollback that errors leaves the cluster-wide outcome just as ambiguous as
+    # a COMMIT that errors.
+    committing = False
 
     try:
         with s.conn.cursor() as cur:
@@ -496,6 +535,7 @@ def sr_session(jr, s: Session, profile: dict) -> None:
             except Exception:  # noqa: BLE001 - visibility is best-effort
                 fragments_seen = 0
 
+        committing = True
         if rnd.chance(0.33):
             s.conn.rollback()
             rolled_back = True
@@ -508,7 +548,7 @@ def sr_session(jr, s: Session, profile: dict) -> None:
         jr.resolve(wids, "FAILED", errmsg="streaming transaction rolled back by client")
         jr.tally("sr_rollback", None)
     else:
-        state = _finish(jr, wids, "sr_session", exc, s.conn)
+        state = _finish(jr, wids, "sr_session", exc, s.conn, at_commit=committing)
         if state == "ACKED" and fragments_seen > 0:
             oracles.saw_streaming_transaction(
                 {"fragment_size": frag, "fragment_unit": unit, "log_rows": fragments_seen}

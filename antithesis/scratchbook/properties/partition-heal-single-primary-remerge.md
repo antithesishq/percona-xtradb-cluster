@@ -158,3 +158,28 @@ the ready/Synced clause must be quiesced or transfer-aware.
   membership bound of heal; (2) all-nodes-Synced asserted at quiescence (or gated on observed
   transfer type: `wsrep_local_state=3` vs SST-in-progress), with gcache sized so short
   partitions always IST if a bounded form of (2) is wanted.
+
+## Triage refinement (2026-09-24, run 5aa4afb557ee963d484ffea49f9a0ad4-63-0)
+
+- Found: "the cluster returns to three Synced nodes after fault injection stops" went red
+  after a total loss of the Primary Component. A `graceful_shutdown` on node1 overlapped
+  dense partitions; all three nodes ended in singleton non-Primary views; node1's
+  SELF-LEAVE never reached the others, and its restart discarded `gvwstate.dat` and got a
+  new gcomm UUID. node2/node3 then sat `Initialized` in a 3-member non-Primary view for
+  600 quiet seconds while node1 looped `unireg_abort` on `pc.wait_prim_timeout`.
+  Galera documents this as needing `pc.bootstrap`; nothing in the harness did it.
+- Conclusion: harness false positive. `verify.py` now gives the cluster 40% of the
+  budget to reconverge unaided, then calls `checks.bootstrap_if_no_primary`, which
+  bootstraps the most advanced node only when: no node is Primary; every unreachable
+  node is down (refused or DNS failure -- a timeout could be a hung Primary) AND is
+  counted inside the reachable nodes' non-Primary component (cluster size 3), so it
+  cannot restore a Primary of its own; the chosen node is at or beyond the highest
+  `wsrep_last_committed` the anytime_ probe ledger (`progress`) ever saw on any node,
+  so a down node known to be ahead is never SST'd over; this holds across two samples
+  15 s apart and is re-checked just before the SET. Residual risk, recorded rather than
+  gated: a down node that advanced past the ledger between probe samples. If
+  `every acknowledged write is present` ever goes red with `operator_bootstrap` set in
+  its details, check that first. Reconvergence is then asserted on the remaining budget,
+  with `operator_bootstrap` and `cluster_status` in the details, and the reach claim
+  "terminal verification bootstrapped a cluster that had lost its primary component"
+  records how often the workload drives the cluster there.

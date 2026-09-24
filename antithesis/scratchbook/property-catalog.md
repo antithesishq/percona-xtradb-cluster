@@ -1,6 +1,6 @@
 ---
 sut_path: /home/colaya/src/customer/customer-percona/percona-xtradb-cluster
-commit: 3db14d5c7111617eb27c6491ff4fabfcd939db88
+commit: b9c61f092df464280243bf5cc59af9043313a927
 updated: 2026-09-24
 external_references:
   - path: https://docs.percona.com/percona-xtradb-cluster/8.4/
