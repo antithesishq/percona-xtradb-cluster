@@ -13,6 +13,9 @@ which is why the tally is worth reading in the first triage.
 DDL targets a fixed pool of scratch tables, and otherwise only touches the
 INDEX structure of the FK pair -- index changes do not alter row content, so
 the checksum set stays comparable while DDL runs against it.
+
+Every shape that has two directions READS THE CATALOG FIRST and emits the one
+that is legal, instead of flipping a coin and hoping. See _toggle.
 """
 
 from __future__ import annotations
@@ -29,8 +32,8 @@ SCHEMA = config.SCHEMA
 # transaction sizes and writeset bytes are drawn from configured-limit families.
 
 
-def _run_ddl(jr, s, stmt: str, shape: str) -> None:
-    """Execute one DDL statement as a tracked episode.
+def _run_ddl(jr, s, stmt: str, shape: str) -> bool:
+    """Execute one DDL statement as a tracked episode. True if it completed.
 
     The episode ledger is what makes "no DDL left unresolved after
     reconvergence" a decidable question: an episode still in ATTEMPTED after
@@ -56,6 +59,7 @@ def _run_ddl(jr, s, stmt: str, shape: str) -> None:
                     "concurrent_driver_invocations": concurrent,
                 }
             )
+        return True
     except Exception as e:  # noqa: BLE001
         errno = db.errno_of(e)
         # A clean DDL rejection is a terminal outcome, not a residue. Only a
@@ -65,31 +69,103 @@ def _run_ddl(jr, s, stmt: str, shape: str) -> None:
         else:
             jr.ddl_end(ddl_id, "UNKNOWN", errno)
         jr.tally(shape, errno)
+        return False
+
+
+# Lookups this module makes before choosing a direction. A failure here is an
+# environment condition -- the node is mid-restart, the connection just died,
+# the table is being renamed past us -- and the only safe response is to emit
+# nothing. Guessing is what produced the errors this function exists to stop.
+def _catalog(jr, s, fn, shape: str, *args) -> object | None:
+    try:
+        return fn(s.conn, *args)
+    except Exception as e:  # noqa: BLE001
+        jr.tally(f"{shape}:lookup_failed", db.errno_of(e))
+        return None
+
+
+def _table_is_there(jr, s, table: str, shape: str) -> bool:
+    """Is this table in the catalog right now?
+
+    A rename_swap that died between its own renames, or a table dropped by a
+    shape that should not have, would otherwise silently zero out three of the
+    six DDL shapes for the rest of the run. The tally is what makes that
+    visible instead of looking like a quiet timeline.
+    """
+    cols = _catalog(jr, s, schema.column_names, shape, table)
+    if cols is None:
+        return False
+    if not cols:
+        jr.tally(f"{shape}:table_absent", None)
+        return False
+    return True
+
+
+def _toggle(jr, s, shape: str, present: bool, create_stmt: str, drop_stmt: str) -> None:
+    """Emit whichever of the two directions the catalog says is legal.
+
+    The coin flip this replaces is the same defect config.EPHEMERAL_TABLE
+    documents for tables, one level down: a CREATE against an object that is
+    already there fails ER_DUP_KEYNAME / ER_DUP_FIELDNAME / ER_FK_DUP_NAME, a
+    DROP against one that is not fails ER_CANT_DROP_FIELD_OR_KEY, and PXC
+    replicates the failing statement anyway. Each one then costs a cluster-wide
+    inconsistency vote, which property-catalog.md's un-injected-vote rule reads
+    as divergence evidence -- so the noise does not merely waste the run, it
+    destroys the signal the terminal checksum oracle depends on. Run
+    5a7b1d9f...-63-0 showed the sharp end of it: one such statement failed to
+    apply on node1 at seqno 606 during a partition, node2 could not vote,
+    declared itself inconsistent and demanded a full SST, and node1 then served
+    a green health check for 164 seconds without committing anything.
+
+    A race against a concurrent driver can still land a stale direction -- the
+    catalog read and the statement are not one atomic unit -- but that is a
+    rare loser rather than every second statement, and the shape x errno tally
+    measures whatever is left.
+    """
+    if present:
+        if _run_ddl(jr, s, drop_stmt, shape):
+            oracles.saw_ddl_drop_of_live_object({"statement": drop_stmt[:200], "node": s.name})
+    else:
+        _run_ddl(jr, s, create_stmt, shape)
 
 
 def ddl_index(jr, s, profile: dict) -> None:
+    # Which slot is still the random draw; only the direction is decided by
+    # what is actually there, so the menu axis is unchanged.
     table = rnd.choice(config.SCRATCH_TABLES + ["wl_fk_parent", "wl_fk_child"])
     idx = f"ix_swarm_{rnd.randint(0, 3)}"
     col = "v" if table in config.SCRATCH_TABLES else ("pv" if table == "wl_fk_parent" else "cv")
-    if rnd.chance(0.5):
-        stmt = f"CREATE INDEX `{idx}` ON `{SCHEMA}`.`{table}` (`{col}`)"
-    else:
-        stmt = f"DROP INDEX `{idx}` ON `{SCHEMA}`.`{table}`"
-    _run_ddl(jr, s, stmt, "ddl_index")
+    # An index lookup on a missing table returns the empty set, which is
+    # indistinguishable from "table is there, index is not" -- and would send
+    # us into a CREATE that fails ER_NO_SUCH_TABLE. Columns disambiguate it:
+    # a table that exists always has some.
+    if not _table_is_there(jr, s, table, "ddl_index"):
+        return
+    have = _catalog(jr, s, schema.index_names, "ddl_index", table)
+    if have is None:
+        return
+    _toggle(
+        jr, s, "ddl_index", idx in have,
+        f"CREATE INDEX `{idx}` ON `{SCHEMA}`.`{table}` (`{col}`)",
+        f"DROP INDEX `{idx}` ON `{SCHEMA}`.`{table}`",
+    )
 
 
 def ddl_column(jr, s, profile: dict) -> None:
     table = rnd.choice(config.SCRATCH_TABLES)
     col = f"c_swarm_{rnd.randint(0, 3)}"
     algo = rnd.choice(["INPLACE", "COPY", "DEFAULT"])
-    if rnd.chance(0.5):
-        stmt = (
-            f"ALTER TABLE `{SCHEMA}`.`{table}` ADD COLUMN `{col}` INT NULL, "
-            f"ALGORITHM={algo}"
-        )
-    else:
-        stmt = f"ALTER TABLE `{SCHEMA}`.`{table}` DROP COLUMN `{col}`, ALGORITHM={algo}"
-    _run_ddl(jr, s, stmt, "ddl_column")
+    have = _catalog(jr, s, schema.column_names, "ddl_column", table)
+    if have is None:
+        return
+    if not have:
+        jr.tally("ddl_column:table_absent", None)
+        return
+    _toggle(
+        jr, s, "ddl_column", col in have,
+        f"ALTER TABLE `{SCHEMA}`.`{table}` ADD COLUMN `{col}` INT NULL, ALGORITHM={algo}",
+        f"ALTER TABLE `{SCHEMA}`.`{table}` DROP COLUMN `{col}`, ALGORITHM={algo}",
+    )
 
 
 def ddl_online_fk(jr, s, profile: dict) -> None:
@@ -100,25 +176,34 @@ def ddl_online_fk(jr, s, profile: dict) -> None:
     """
     child = rnd.choice(config.SCRATCH_TABLES)
     name = f"fk_swarm_{rnd.randint(0, 3)}"
+    if not _table_is_there(jr, s, child, "ddl_online_fk"):
+        return
+    # Schema-wide: the name may already be live on a DIFFERENT scratch table,
+    # and adding it here would fail ER_FK_DUP_NAME. When it is taken elsewhere
+    # the useful move is to drop it from its actual owner rather than skip the
+    # draw, which keeps both directions exercised at full rate.
+    owners = _catalog(jr, s, schema.foreign_key_owners, "ddl_online_fk")
+    if owners is None:
+        return
+    owner = owners.get(name)
+
     try:
         with s.conn.cursor() as cur:
             cur.execute("SET SESSION foreign_key_checks = 0")
     except Exception:  # noqa: BLE001
         return
 
-    if rnd.chance(0.5):
-        # `pref`, not `sid`. sid is BIGINT UNSIGNED and wl_fk_parent.pid is
-        # INT; MySQL requires the two ends of a foreign key to match in width
-        # and signedness, so the sid form was rejected errno 3780 every time
-        # it was drawn and this whole repro family never once executed.
-        stmt = (
-            f"ALTER TABLE `{SCHEMA}`.`{child}` ADD CONSTRAINT `{name}` "
-            f"FOREIGN KEY (pref) REFERENCES `{SCHEMA}`.`wl_fk_parent` (pid) "
-            "ON DELETE CASCADE ON UPDATE CASCADE, ALGORITHM=INPLACE"
-        )
-    else:
-        stmt = f"ALTER TABLE `{SCHEMA}`.`{child}` DROP FOREIGN KEY `{name}`"
-    _run_ddl(jr, s, stmt, "ddl_online_fk")
+    # `pref`, not `sid`. sid is BIGINT UNSIGNED and wl_fk_parent.pid is INT;
+    # MySQL requires the two ends of a foreign key to match in width and
+    # signedness, so the sid form was rejected errno 3780 every time it was
+    # drawn and this whole repro family never once executed.
+    _toggle(
+        jr, s, "ddl_online_fk", owner is not None,
+        f"ALTER TABLE `{SCHEMA}`.`{child}` ADD CONSTRAINT `{name}` "
+        f"FOREIGN KEY (pref) REFERENCES `{SCHEMA}`.`wl_fk_parent` (pid) "
+        "ON DELETE CASCADE ON UPDATE CASCADE, ALGORITHM=INPLACE",
+        f"ALTER TABLE `{SCHEMA}`.`{owner}` DROP FOREIGN KEY `{name}`",
+    )
 
     try:
         with s.conn.cursor() as cur:

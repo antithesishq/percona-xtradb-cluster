@@ -303,6 +303,19 @@ def saw_ddl_under_load(details: Details) -> None:
     reachable("a data-definition statement completed under concurrent replicated writes", details)
 
 
+def saw_ddl_drop_of_live_object(details: Details) -> None:
+    """The generator's schema lookup is load-bearing; this proves it works.
+
+    ddl.py no longer coin-flips CREATE against DROP -- it reads the server's
+    catalog and emits whichever direction is legal. A lookup that silently
+    returned nothing would degrade that into a create-only generator, every
+    second statement would fail ER_DUP_KEYNAME, and nothing else in the run
+    would say so. A completed DROP is only reachable if a CREATE landed first
+    and the lookup then saw it, so one claim covers both halves.
+    """
+    reachable("a data-definition statement dropped an object the catalog reported present", details)
+
+
 def saw_unknown_outcome(details: Details) -> None:
     """Proves the three-state protocol is genuinely exercised.
 

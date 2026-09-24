@@ -1,7 +1,7 @@
 ---
 sut_path: /home/colaya/src/customer/customer-percona/percona-xtradb-cluster
-commit: 8690898a7c9d70b035b1c3823c97b7f13a372e9e
-updated: 2026-09-23
+commit: 3db14d5c7111617eb27c6491ff4fabfcd939db88
+updated: 2026-09-24
 external_references:
   - path: https://docs.percona.com/percona-xtradb-cluster/8.4/
     why: Upstream product documentation (user-approved scope: repo + upstream docs)
@@ -164,6 +164,53 @@ workload-side oracle defect, which the quieter report made the largest red
   question), and the commit window is now the trailing `PXC_GREEN_WINDOW`
   rather than "any time since the node went green" — one probe landing as the
   green run opened used to exempt the node for as long as it then stayed wedged.
+
+### Post-triage corrections (run `5a7b1d9f…-63-0`, 2026-09-24)
+
+The availability fix verified: 49.4% → 20.9% counterexamples, evaluations 712 →
+172, and **zero** failures without supporting evidence (every one now carries
+`probe_failed_seconds ≥ 135s`, most with `probe_reason` = a write that *timed
+out*, and `fc_paused_ns_delta` up to 10.4s). The reds that remain are the
+flow-control leg this property was written for.
+
+One workload correction, and it is the same defect `config.EPHEMERAL_TABLE`
+already documents for tables, one level down:
+
+- `ddl.py`'s `ddl_index`, `ddl_column` and `ddl_online_fk` flipped a coin
+  between CREATE and DROP without knowing whether the object existed, so about
+  half of every such statement was invalid on arrival — the class is
+  ER_DUP_KEYNAME 1061, ER_DUP_FIELDNAME 1060, ER_FK_DUP_NAME 1826 and
+  ER_CANT_DROP_FIELD_OR_KEY 1091, of which the measured run shows 1091 and 1826.
+  PXC replicates
+  the failing statement anyway and each one costs a cluster-wide inconsistency
+  vote, which the **un-injected-vote rule** under `cross-node-row-equality`
+  reads as divergence evidence. A fault-free local validation measured it
+  exactly: 29 failed scratch DDLs, 29 voting rounds. All three shapes now read
+  the server's catalog and emit whichever direction is legal, and skip entirely
+  when the lookup fails or the table is momentarily absent. New reach claim
+  `a data-definition statement dropped an object the catalog reported present`
+  guards the lookup itself: a lookup that silently returned nothing would
+  degrade the generator into create-only, and nothing else would say so.
+  Foreign key names are scoped per **schema** in MySQL 8, not per table, so that
+  lookup is schema-wide and a name already live on another table is dropped from
+  its owner rather than re-added here — a per-table lookup would have been worse
+  than the coin flip (three of four draws doomed instead of half). Skips are
+  tallied (`{shape}:lookup_failed`, `{shape}:table_absent`) so a vanished table
+  cannot silently zero out three of the six DDL shapes.
+
+The catalog is read fresh before each statement rather than cached, because
+`ddl_rename_swap` moves every index, column and constraint to the other table
+name — and the swap comes from a different driver invocation, so no in-process
+ledger can see it.
+
+Why it mattered beyond noise, from the same run: one such statement failed to
+apply on node1 at seqno 606 *during a partition*; node2 could not vote, took
+`Can't vote when not at least JOINED. Assuming inconsistency. Full SST is
+required`, and node1 then served a green health check through a 164-second
+unbroken run of writes that timed out (`probe_failed_seconds: 164.4`), its
+error log silent from vtime 95 to 245. `every Synced node agrees on the set of tables and
+indexes` also went red (17 CE) with node1 permanently missing
+`wl_scratch_ephemeral` while still Synced.
 
 ### Commands
 

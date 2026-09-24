@@ -211,3 +211,21 @@ neither applied everywhere nor rolled back anywhere.
   faults, which would raise priority.
 - Conclusion: tagged `(partial: completion path traced to to_isolation_end:1971; abort
   paths not exhaustively traced)`.
+
+### Generator hygiene (2026-09-24)
+
+Until 2026-09-24 this property's episode ledger was dominated by DDL that was
+invalid before it left the client: `ddl.py` chose CREATE or DROP by coin flip
+without consulting the schema. Those episodes reached `FAILED` with a shape
+errno (1060/1061/1091/1826) and were terminal, so they never violated the
+"no unresolved DDL" invariant — but they crowded the ledger and, worse, each
+one bought a cluster-wide inconsistency vote. See
+[cross-node-row-equality](cross-node-row-equality.md) for the measurement and
+for the outage one of them caused under partition.
+
+The generator now reads `information_schema` before each statement and emits
+only the legal direction (schema-wide for foreign key names, which MySQL scopes
+per schema rather than per table), so a `FAILED` episode with a shape errno is
+from here on a *race* or a real finding, not the normal case. That makes the episode
+ledger usable as evidence for the completion-liveness question this property
+actually owns.

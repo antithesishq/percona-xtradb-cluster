@@ -61,9 +61,10 @@ cataloging, so **assertion names must be inline constant string literals**.
 **oracle-tests/**
 Runtime-free detection tests for the assertion logic, run with
 `bash antithesis/oracle-tests/run.sh`. Run them after any change to
-`workload/pxcwl/checks.py`, `oracles.py`, `levers.py` or `probe.py` — they
-inject a real divergence and assert the oracle reports it, which a smoke test
-does not.
+`workload/pxcwl/checks.py`, `oracles.py`, `levers.py`, `probe.py` or
+`ddl.py`. They are detection tests: each one also feeds the *old, broken*
+behaviour to the same checker and requires it to be caught, so a green result
+distinguishes a working oracle from a blind one — which a smoke test does not.
 See `oracle-tests/README.md`.
 
 **VALIDATION.md**

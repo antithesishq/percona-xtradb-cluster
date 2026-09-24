@@ -246,6 +246,68 @@ def column_signature(conn, table: str) -> list[tuple[str, str]]:
         return [(r[0], r[1]) for r in cur.fetchall()]
 
 
+# --------------------------------------------------------------------------
+# Live schema introspection for the DDL generator
+#
+# Read fresh immediately before each statement rather than cached in the
+# journal. A cache cannot survive ddl_rename_swap: renaming wl_scratch_0 to
+# wl_scratch_2 moves every index, column and constraint on it to the other
+# name, so any ledger keyed on (table, object) is wrong the instant a swap
+# lands -- and the swap is issued by a different driver invocation, so no
+# in-process bookkeeping can see it either. The server's own catalog is the
+# only view that is right by construction.
+# --------------------------------------------------------------------------
+
+
+def column_names(conn, table: str) -> set[str]:
+    """Columns of one table. Empty means the table is not there right now.
+
+    Every table has at least one column, so the empty set is an unambiguous
+    "absent" signal, which is what the DDL generator gates on.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT COLUMN_NAME FROM information_schema.columns "
+            "WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s",
+            (SCHEMA, table),
+        )
+        return {r[0] for r in cur.fetchall()}
+
+
+def index_names(conn, table: str) -> set[str]:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT DISTINCT INDEX_NAME FROM information_schema.statistics "
+            "WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s",
+            (SCHEMA, table),
+        )
+        return {r[0] for r in cur.fetchall()}
+
+
+def foreign_key_owners(conn) -> dict[str, str]:
+    """constraint name -> the table it is on, for the WHOLE schema.
+
+    Schema-wide, not per-table, and that is the whole point. MySQL 8 requires a
+    foreign key constraint name to be unique per SCHEMA, so a per-table lookup
+    reports `fk_swarm_2` absent from wl_scratch_2 while it sits on
+    wl_scratch_0, and an ADD against it fails ER_FK_DUP_NAME 1826. That pair is
+    in local-validate-20260923T211617Z.log verbatim -- id=32 DONE on
+    wl_scratch_0, id=44 FAILED 1826 on wl_scratch_2 -- and a per-table lookup
+    would be WORSE than the coin flip it replaced, because once a name is taken
+    anywhere three of the four table draws for it are doomed rather than half.
+
+    Indexes and columns really are per-table, so those two lookups are keyed
+    correctly; this is the one that is not.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT CONSTRAINT_NAME, TABLE_NAME FROM information_schema.table_constraints "
+            "WHERE TABLE_SCHEMA = %s AND CONSTRAINT_TYPE = 'FOREIGN KEY'",
+            (SCHEMA,),
+        )
+        return {r[0]: r[1] for r in cur.fetchall()}
+
+
 def checksum_expr(table: str, columns: list[str]) -> str:
     """An order-independent, multiset-sensitive checksum over a table.
 

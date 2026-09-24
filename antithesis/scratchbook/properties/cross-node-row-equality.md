@@ -149,3 +149,81 @@ None — all three resolved; see Investigation Log.
 ## Synthesis refinement (2026-09-10)
 
 Two framing changes: (1) quiesced-checkpoint convention — under active faults the Always runs as opportunistic gated attempts; the guaranteed full-strength check lives in eventually_/finally_ with faults paused (ANTITHESIS_STOP_FAULTS for mid-run quiet windows). (2) Un-injected-vote rule — any inconsistency vote NOT attributable to injected sabotage is divergence evidence and fails this property (touching traffic converts divergence into evictions before a checksum sees it); prefer write-once witness tables; checksum evicted nodes before rejoin.
+
+### Un-injected-vote rule: the harness was the biggest source of votes (2026-09-24)
+
+The rule under this property — any inconsistency vote not attributable to
+injected sabotage counts as divergence evidence — was being spent almost
+entirely on the harness's own bad DDL.
+
+`ddl.py`'s index, column and FK shapes chose CREATE or DROP by coin flip
+without consulting the schema, so roughly half of every such statement was
+invalid on arrival. The reachable class is ER_DUP_KEYNAME 1061, ER_DUP_FIELDNAME
+1060, ER_FK_DUP_NAME 1826 and ER_CANT_DROP_FIELD_OR_KEY 1091; the log below
+actually shows only **1091 and 1826** — the index and column random walks
+happened to trend toward absent that run, so the duplicate-name half never
+surfaced. PXC replicates a TOI statement before
+applying it, so each invalid one failed to apply cluster-wide and bought a
+voting round. Measured in a **fault-free** local validation
+(`local-validate-20260923T211617Z.log`): 48 × MY-001091 and 10 × MY-001826 in
+the replica apply log, `ddl by state` showing `FAILED 1091 n=24` and
+`FAILED 1826 n=5`, and **29 inconsistency voting rounds** — an exact match, one
+vote per failed statement, in 4.5 minutes with no faults at all.
+
+#### Foreign key names are scoped per SCHEMA, not per table
+
+The first cut of this fix looked FK constraint names up with a `TABLE_NAME`
+predicate, which is wrong and would have made the FK shape *worse* than the coin
+flip: once `fk_swarm_2` is live anywhere in the schema, three of the four table
+draws for that name emit an ADD that fails 1826, instead of half. The same log
+has the pair verbatim — `id=32 state=DONE` adding `fk_swarm_2` to
+`wl_scratch_0`, `id=44 state=FAILED errno=1826` adding it to `wl_scratch_2`.
+`schema.foreign_key_owners` now returns name → owning table for the whole
+schema, and when a name is taken elsewhere the generator drops it from its
+actual owner rather than wasting the draw. Indexes and columns genuinely are
+per-table, so those two lookups were keyed correctly.
+
+This is the same defect `config.EPHEMERAL_TABLE` documents at the table level,
+one level down. Fixed 2026-09-24: all three shapes read
+`information_schema` immediately before the statement and emit whichever
+direction is legal (`ddl._toggle`). The read is deliberately *not* cached —
+`ddl_rename_swap` relocates every index, column and constraint to the other
+table name, and the swap is issued by a different driver invocation, so no
+ledger keyed on (table, object) can stay correct.
+
+#### Why it was not merely wasteful
+
+Run `5a7b1d9f923d0f006643c401ed3dc1ae-63-0` showed the sharp end. At vtime
+88.45, node1 logged `Replica SQL: Error 'Can't DROP 'c_swarm_2'` →
+`Event 1 Query apply failed: 1, seqno 606`. node2 was partitioned at that
+moment and therefore could not vote:
+
+```
+Can't vote when not at least JOINED. Assuming inconsistency. Full SST is required
+[ERROR] Inconsistency detected: Inconsistent by consensus on 23fab032-…:606
+```
+
+node1 then formed a 2-node PRIM view and went **silent in its error log from
+vtime 95 to 245** while holding `wsrep_local_state=4` and
+`pxc_maint_mode=DISABLED` — clustercheck-green. The probe's own measurement of
+the same episode is `probe_failed_seconds: 164.4`: a continuous run of writes
+that timed out, ending only when the property fired at vtime 239.6. The two
+numbers measure different things (log silence vs. failed-write run) and are
+consistent with each other. The top crash site of
+that run was `gcs/src/gcs_node.cpp:224`, `assert(node->last_applied >= 0)`,
+immediately after `gcs_state_msg_last_vote()` reads the vote fields from a
+peer's state message: 93 aborts, the same code path.
+
+`every Synced node agrees on the set of tables and indexes` failed in the same
+window with node1 permanently missing `wl_scratch_ephemeral` (15 tables vs 16,
+17 index rows vs 18) while all three reported Synced on one state UUID.
+
+#### What this now makes decidable
+
+With the generator no longer manufacturing votes, a vote that is *not* fenced
+sabotage is once again evidence, which is what the rule above assumes. The
+residual is a race — the catalog read and the statement are not atomic against
+a concurrent driver — and the `shape × errno` tally measures it directly: watch
+`ddl_index`/`ddl_column`/`ddl_online_fk` against errnos 1060/1061/1091/1826 in
+the next run's journal dump. Regression coverage:
+`antithesis/oracle-tests/test_ddl_direction.py`.

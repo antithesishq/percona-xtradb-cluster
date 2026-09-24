@@ -106,6 +106,11 @@ NOPK_TABLE = "wl_nopk"
 # DDL targets. A fixed pool keeps the schema namespace finite and enumerable,
 # so "no DDL residue after reconvergence" is a decidable question. Seeded once
 # and never dropped: every other DDL shape needs these to be there.
+#
+# The indexes, columns and constraints ON these tables come and go, and which
+# direction is legal at any moment is read from the server's catalog rather
+# than guessed -- see ddl._toggle for why a coin flip there was the same bug
+# EPHEMERAL_TABLE describes below, one level down.
 SCRATCH_TABLES: list[str] = [f"wl_scratch_{i}" for i in range(4)]
 
 # The ONLY table ddl_create_drop touches. Held apart from SCRATCH_TABLES
