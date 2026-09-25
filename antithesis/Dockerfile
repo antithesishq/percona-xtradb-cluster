@@ -376,6 +376,31 @@ ARG PXC_BUILD_TYPE=Debug
 ARG PXC_OPT_FLAGS="-g -O2"
 ARG PXC_PREFIX=/usr/local/pxc
 
+# Disk footprint. With full -g, the object tree alone is ~8 GB, and the whole
+# build peaked past 14 GB before mysqld was even linked -- more than a 25 GB
+# build VM has once images and cache are counted (measured 2026-09-24: three
+# builds died silently at 92-96% of this step on a full disk).
+#
+#   -gz                               compresses DWARF in the .o files only.
+#   -Wl,--compress-debug-sections=none  makes the LINKED binaries carry plain
+#                                     DWARF regardless of the toolchain's
+#                                     default. mysqld symbolizes its own crash
+#                                     backtraces at runtime (bundled
+#                                     libbacktrace), and the file:line frames
+#                                     are what triage-scope.md's ownership
+#                                     rule reads -- so the shipped binaries
+#                                     keep plain DWARF, as before. Checked
+#                                     on wsrep-lib with this toolchain: the
+#                                     loaded code and data come out
+#                                     byte-identical; only the build ID and
+#                                     the "-gz" GCC records in
+#                                     DW_AT_producer differ.
+#   rm -rf /build                     after install, in the same step, so the
+#                                     object tree is not kept in the layer.
+#
+# Set PXC_OBJ_DEBUG_COMPRESS="" to get the old full-size objects back.
+ARG PXC_OBJ_DEBUG_COMPRESS="-gz"
+
 RUN set -eux; \
     JOBS="${BUILD_JOBS:-$(nproc)}"; \
     mkdir -p /build && cd /build; \
@@ -389,6 +414,8 @@ RUN set -eux; \
         EXTRA_C=""; \
         EXTRA_LD="-Wl,--build-id"; \
     fi; \
+    EXTRA_C="$EXTRA_C $PXC_OBJ_DEBUG_COMPRESS"; \
+    EXTRA_LD="$EXTRA_LD -Wl,--compress-debug-sections=none"; \
     cmake /src \
         -DCMAKE_BUILD_TYPE="$PXC_BUILD_TYPE" \
         -DCMAKE_C_FLAGS_DEBUG="$OPT_FLAGS $EXTRA_C" \
@@ -420,7 +447,8 @@ RUN set -eux; \
         echo "=================================================================="; \
         exit 1; \
     fi; \
-    make install
+    make install; \
+    cd / && rm -rf /build
 
 # Verify the server really came out debug-configured before anything
 # downstream depends on it. A silently-NDEBUG mysqld would make this whole tier
@@ -465,6 +493,10 @@ RUN set -eux; \
             || { echo "ANTITHESIS: $artifact is stripped — /symbols would be useless" >&2; exit 1; }; \
         readelf -n "$artifact" | grep -qi 'Build ID' \
             || { echo "ANTITHESIS: $artifact has no GNU build id — symbolization will fail" >&2; exit 1; }; \
+        if readelf -S -W "$artifact" | grep -E '\.debug_info' | grep -qE ' [A-Z]*C[A-Z]* +[0-9]+ +[0-9]+ +[0-9]+ *$'; then \
+            echo "ANTITHESIS: $artifact has COMPRESSED debug sections — the -gz object" \
+                 "flag leaked into the link; backtrace file:line may be lost" >&2; exit 1; \
+        fi; \
         echo "ANTITHESIS: $artifact is unstripped and has a build id"; \
     done
 
