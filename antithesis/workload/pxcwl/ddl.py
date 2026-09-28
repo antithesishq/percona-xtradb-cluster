@@ -20,6 +20,11 @@ that is legal, instead of flipping a coin and hoping. See _toggle.
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
+import os
+import time
+
 from . import config, db, oracles, rnd, schema
 
 SCHEMA = config.SCHEMA
@@ -76,9 +81,32 @@ def _run_ddl(jr, s, stmt: str, shape: str) -> bool:
 # environment condition -- the node is mid-restart, the connection just died,
 # the table is being renamed past us -- and the only safe response is to emit
 # nothing. Guessing is what produced the errors this function exists to stop.
+#
+# The lookup runs under wsrep_sync_wait's READ bit. Without it, the read is
+# served from whatever this node has applied so far. TOI returns to the
+# client once the ORIGINATING node has applied the statement, so a driver
+# on another node can read a catalog one DDL behind the cluster and emit
+# the direction that was legal a moment ago. Run 93ec5045...-63-2 still
+# drew 952 inconsistency votes after the direction fix, and 557 of them
+# were ER_CANT_DROP_FIELD_OR_KEY on an object another node had already
+# dropped. The session's own level is restored afterwards: the traffic
+# profile chose it, and sync_wait_read's oracle depends on it.
+LOOKUP_SYNC_WAIT_READ_BIT = 1
+
+
 def _catalog(jr, s, fn, shape: str, *args) -> object | None:
     try:
-        return fn(s.conn, *args)
+        with s.conn.cursor() as cur:
+            cur.execute("SELECT @@SESSION.wsrep_sync_wait")
+            prior = int(cur.fetchall()[0][0])
+            cur.execute(
+                "SET SESSION wsrep_sync_wait = %s", (prior | LOOKUP_SYNC_WAIT_READ_BIT,)
+            )
+        try:
+            return fn(s.conn, *args)
+        finally:
+            with s.conn.cursor() as cur:
+                cur.execute("SET SESSION wsrep_sync_wait = %s", (prior,))
     except Exception as e:  # noqa: BLE001
         jr.tally(f"{shape}:lookup_failed", db.errno_of(e))
         return None
@@ -117,10 +145,13 @@ def _toggle(jr, s, shape: str, present: bool, create_stmt: str, drop_stmt: str) 
     declared itself inconsistent and demanded a full SST, and node1 then served
     a green health check for 164 seconds without committing anything.
 
-    A race against a concurrent driver can still land a stale direction -- the
-    catalog read and the statement are not one atomic unit -- but that is a
-    rare loser rather than every second statement, and the shape x errno tally
-    measures whatever is left.
+    The catalog read and the statement are not one atomic unit, and the race
+    against concurrent drivers was NOT rare: run 93ec5045...-63-2 still drew
+    952 votes, mostly 1091. So every caller of this function runs under
+    _scratch_lock (see run_one), and the read itself is causal (see _catalog).
+    The residue is a statement whose connection died mid-flight: its TOI may
+    still be ordered after the lock is released. The shape x errno tally
+    measures it.
     """
     if present:
         if _run_ddl(jr, s, drop_stmt, shape):
@@ -268,9 +299,56 @@ DDL_OPS = [
 ]
 
 
+# The shapes that read the catalog and then act on what they read, plus
+# rename_swap, which moves every index, column and constraint those reads are
+# keyed on. Each one runs alone across the whole workload container. This does
+# not narrow the concurrency the DDL family exists to exercise. TOI already
+# orders DDL cluster-wide, and TOI against concurrent DML is untouched.
+# ddl_truncate and ddl_create_drop still run unserialized, so two TOI
+# statements issued from different nodes at once remain reachable.
+SERIALIZED = frozenset({ddl_index, ddl_column, ddl_online_fk, ddl_rename_swap})
+
+# Bounded so a driver never parks its whole wall budget behind a peer whose
+# lookup is stuck in a causal-read wait. A skip is tallied, not silent.
+LOCK_WAIT_SECONDS = 5.0
+
+
+@contextlib.contextmanager
+def _scratch_lock():
+    """Container-wide exclusion for SERIALIZED shapes. Yields whether it is held.
+
+    An flock, not a journal lease: the kernel releases it when the holder
+    dies, and an eventually_ command kills every running driver. A lease
+    would need a repair path. This needs none.
+    """
+    os.makedirs(config.JOURNAL_DIR, exist_ok=True)
+    fd = os.open(os.path.join(config.JOURNAL_DIR, "ddl-scratch.lock"), os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        deadline = time.monotonic() + LOCK_WAIT_SECONDS
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    yield False
+                    return
+                time.sleep(0.05)
+        yield True
+    finally:
+        os.close(fd)
+
+
 def run_one(jr, s, profile: dict) -> None:
     op = rnd.choice(DDL_OPS)
     try:
-        op(jr, s, profile)
+        if op not in SERIALIZED:
+            op(jr, s, profile)
+            return
+        with _scratch_lock() as held:
+            if not held:
+                jr.tally(f"{op.__name__}:lock_busy", None)
+                return
+            op(jr, s, profile)
     except Exception as e:  # noqa: BLE001
         jr.tally("ddl:uncaught", db.errno_of(e))

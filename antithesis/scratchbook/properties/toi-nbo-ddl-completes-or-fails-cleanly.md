@@ -229,3 +229,10 @@ per schema rather than per table), so a `FAILED` episode with a shape errno is
 from here on a *race* or a real finding, not the normal case. That makes the episode
 ledger usable as evidence for the completion-liveness question this property
 actually owns.
+
+It did not, at first. Run `93ec5045...-63-2` still drew ~950 votes, from a
+cross-driver race and from stale catalog reads on nodes that had not yet
+applied the previous TOI. Since 2026-09-28 the read-then-act shapes are
+serialized under `ddl._scratch_lock`, and the lookup is causal. See the
+follow-up note in `property-catalog.md`. A shape-errno `FAILED` episode is
+now expected only from a statement whose connection died mid-flight.

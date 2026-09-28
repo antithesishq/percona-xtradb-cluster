@@ -239,16 +239,28 @@ RECOVERED_POSITION=""
 
 recover_position() {
     local recover_log="${STATE_DIR}/wsrep-recover.log"
+    local recover_stdio="${STATE_DIR}/wsrep-recover.stdio"
     RECOVERED_POSITION=""
     : > "${recover_log}"
+    : > "${recover_stdio}"
+    # Hand the log to mysql, for the same reason LOG_ERROR is chowned below.
+    # mysqld drops to --user=mysql BEFORE it opens --log-error, and `: >` run
+    # as root creates a root-owned 0644 file. Without this chown, every
+    # recovery in run 93ec5045...-63-2 exited rc=1 without writing a single
+    # line. So every rejoin started without --wsrep_start_position, which is
+    # not the path mysqld_safe and galera-recovery take in the field.
+    chown mysql:mysql "${recover_log}" 2>/dev/null || true
 
     emit "recover_start"
+    # stdout/stderr are kept, not discarded. They are where mysqld reports a
+    # failure that happens before --log-error is open: exactly the failure
+    # above, which /dev/null made invisible.
     "${PXC_PREFIX}/bin/mysqld" \
         --defaults-file="${DEFAULTS_FILE}" \
         --datadir="${DATADIR}" \
         --user=mysql \
         --wsrep-recover \
-        --log-error="${recover_log}" >/dev/null 2>&1
+        --log-error="${recover_log}" >"${recover_stdio}" 2>&1
     local rc=$?
 
     # Accept both the bracketed '[WSREP]' and unbracketed 'WSREP:' forms.
@@ -263,6 +275,7 @@ recover_position() {
     # Surface the recover log so an unparsed position is debuggable rather
     # than a silent fallback.
     sed -e 's/^/[wsrep-recover] /' "${recover_log}" || true
+    sed -e 's/^/[wsrep-recover:stdio] /' "${recover_stdio}" || true
 
     if [[ -z "${pos}" ]]; then
         emit "recover_no_position" "\"rc\":${rc}"

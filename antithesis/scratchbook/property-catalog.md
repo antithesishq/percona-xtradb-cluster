@@ -1,7 +1,7 @@
 ---
 sut_path: /home/colaya/src/customer/customer-percona/percona-xtradb-cluster
-commit: b9c61f092df464280243bf5cc59af9043313a927
-updated: 2026-09-24
+commit: e6ee87a6212ce7f49fbb7061f5c615cc796dda27
+updated: 2026-09-28
 external_references:
   - path: https://docs.percona.com/percona-xtradb-cluster/8.4/
     why: Upstream product documentation (user-approved scope: repo + upstream docs)
@@ -202,6 +202,33 @@ The catalog is read fresh before each statement rather than cached, because
 `ddl_rename_swap` moves every index, column and constraint to the other table
 name — and the swap comes from a different driver invocation, so no in-process
 ledger can see it.
+
+**Follow-up, 2026-09-28 (run `93ec5045aee835409f87b8ad11e90fc5-63-2`).** The
+direction fix was not enough. The run still drew 952 `initiates vote on`
+events (a sample at the 999 search cap): 1091 = 557, 1060 = 138, 1826 = 120,
+1061 = 108. Failures went in both directions (107 DROP FOREIGN KEY on a
+missing name, 36 ADD on a taken one). One of those votes landed on a node
+that was mid-IST: "Can't vote when not at least JOINED. Assuming
+inconsistency", then `Inconsistent by consensus`, and the node never came
+back for the rest of the timeline. Two mechanisms, both fixed in `ddl.py`:
+
+- *Cross-driver race.* Lookup and statement are not atomic, and several
+  `parallel_driver_` invocations issue DDL at once. `ddl_index`,
+  `ddl_column`, `ddl_online_fk` and `ddl_rename_swap` now run under a
+  container-wide `flock` (`ddl._scratch_lock`). The kernel drops it if the
+  holder is killed, so it needs no lease repair. `ddl_truncate` and
+  `ddl_create_drop` stay unserialized, so concurrent TOI from different
+  nodes is still exercised. A lock wait over 5 s is skipped and tallied as
+  `{shape}:lock_busy`.
+- *Stale node.* TOI acknowledges once the originating node has applied the
+  statement, so a lookup on another node can read the catalog one DDL
+  behind. The lookup now runs with the `wsrep_sync_wait` READ bit OR-ed into
+  the session's level, then restores the level the traffic profile chose.
+
+`oracle-tests/test_ddl_concurrent_drivers.py` pins both. It runs four
+threads over three lagging node views against a totally ordered
+authoritative catalog, and requires zero invalid statements. It then
+removes each fix and requires the model to catch the result.
 
 Why it mattered beyond noise, from the same run: one such statement failed to
 apply on node1 at seqno 606 *during a partition*; node2 could not vote, took
