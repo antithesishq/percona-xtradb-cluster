@@ -2,8 +2,9 @@
 # Run every oracle test. No container runtime needed: the workload is driven
 # against stubbed antithesis/pymysql packages (see helper_stubs.py).
 #
-# Run this after ANY change to workload/pxcwl/checks.py, oracles.py or
-# levers.py. The comparison tests are detection tests -- they assert that a
+# Run this after ANY change to workload/pxcwl/checks.py, oracles.py,
+# levers.py or pxc-node/entrypoint.sh. antithesis/local-validate.sh runs it as
+# its offline:oracle-tests step. The comparison tests are detection tests -- they assert that a
 # real divergence is still caught, not merely that a clean cluster passes.
 set -uo pipefail
 cd "$(dirname "$0")"

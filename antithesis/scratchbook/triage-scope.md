@@ -1,6 +1,6 @@
 ---
 sut_path: /home/colaya/src/customer/customer-percona/percona-xtradb-cluster
-updated: 2026-09-23
+updated: 2026-09-28
 source: customer directive, relayed 2026-09-23 — "Percona is not interested in
   property failures related to bugs in mysql, they can't control the upstream,
   they want to focus on property failures related to bugs in percona products."
@@ -105,6 +105,18 @@ are bugs, reported instead by the `Unreachable`s `mysqld assertion failed at
 <file>:<line>` and `mysqld died on fatal signal <N> without a failed assertion`,
 which fail when seen. Before that gate, every assert abort also turned the
 "would not restart" claim greener (460 passes in `c89f2f7a…-63-2`).
+
+**Undocumented `unireg_abort` is a bug since 2026-09-28 (unbuilt).** A
+`unireg_abort` counts as coverage only when the `[ERROR]` lines just before
+`Aborting` match a cited pattern in `UNIREG_DOCUMENTED_CAUSES`
+(`pxc-node/entrypoint.sh`). Today the list holds only `pc.wait_prim_timeout`,
+the only cause in runs `c89f2f7a…-63-2` and `93ec5045…-63-2`. Any other cause
+fails `mysqld never stops itself for an undocumented reason` and
+`mysqld stopped itself after <MY-code> [<subsystem>]`, and it skips the four
+coverage claims. Triage those by caller, like an assert site. A `[Galera]` or
+`[WSREP]` key is Percona's. An upstream subsystem key (`[InnoDB]`, `[Server]`)
+needs the log to show whether a wsrep path got it there. Widen the allowlist
+only with a source citation, and never to make a count go down.
 
 All four carry `node`, `boot`, `kind`, `status`, `field_would_restart`,
 `reached_ready`, `sst_failed`, `inconsistent` and `last_error` — the last being

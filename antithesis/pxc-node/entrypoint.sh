@@ -60,8 +60,9 @@ BOOT_COUNT=0
 # Error log line count at the start of the current boot, so a death is judged
 # only on the log this boot produced.
 BOOT_LOG_OFFSET=0
-# Set by assert_failed_site: 1 when this boot's death was a failed assertion
-# or a fatal signal, i.e. a bug rather than a documented death path.
+# Set by assert_death_class and its helpers: 1 when this boot's death was a
+# failed assertion, a fatal signal or an undocumented unireg_abort, i.e. a bug
+# rather than a documented death path.
 BUG_DEATH=0
 EXIT_STATUS=0
 EXIT_KIND=""
@@ -158,6 +159,32 @@ A_FATAL_SIGNAL_LINE=8
 A_FATAL_EXIT_UNDIAGNOSED="mysqld never dies on a fatal path without a diagnosable log line"
 A_FATAL_EXIT_UNDIAGNOSED_LINE=9
 
+# unireg_abort (exit status 1) is mysqld stopping itself after logging an
+# [ERROR]. Some of those stops are the documented response to a condition
+# fault injection legitimately causes; those stay coverage (the four reach
+# claims above). Any other cause is a bug and fails here. Two tiers, as for
+# asserts: a declared umbrella, and one property per cause, keyed on the
+# MY-code of the last [ERROR] before "Aborting". Galera and WSREP lines all
+# carry MY-000000, so for that code the key also carries the normalized
+# message, or every wsrep cause would collapse into one property.
+A_UNIREG_UNDOCUMENTED="mysqld never stops itself for an undocumented reason"
+A_UNIREG_UNDOCUMENTED_LINE=10
+A_UNIREG_CAUSE_LINE=11
+
+# Documented unireg_abort causes, as EREs matched against the [ERROR] lines
+# just before "Aborting" (see unireg_cause_lines). Add a pattern ONLY with a
+# source citation showing the stop is the intended response to a condition
+# the fault injector can create. Never add one to make a count go down.
+UNIREG_DOCUMENTED_CAUSES=(
+    # No primary component within pc.wait_prim_timeout (default PT30S): gcomm
+    # throws ETIMEDOUT (galera gcomm/src/pc.cpp:161-177, defaults.cpp:66,
+    # doc/source/wsrep-provider-index.rst "pc.wait_prim_timeout"), and
+    # wsrep_init_startup() unireg_abort(1)s on the failed connect
+    # (sql/wsrep_mysqld.cc:1297). A partition, or peers that are down or
+    # non-primary, legitimately cause it.
+    '\[Galera\] failed to open gcomm backend connection: [0-9]+: failed to reach primary view \(pc\.wait_prim_timeout\)'
+)
+
 # Minimal JSON string escaping. The payload is one line of mysqld error log,
 # which routinely contains quotes, backslashes and stray control bytes.
 json_escape() {
@@ -190,6 +217,7 @@ sdk_declare_catalog() {
     sdk_unreachable "${A_ASSERT_ANY}"            "${A_ASSERT_ANY_LINE}"            false
     sdk_unreachable "${A_FATAL_SIGNAL_ANY}"      "${A_FATAL_SIGNAL_ANY_LINE}"      false
     sdk_unreachable "${A_FATAL_EXIT_UNDIAGNOSED}" "${A_FATAL_EXIT_UNDIAGNOSED_LINE}" false
+    sdk_unreachable "${A_UNIREG_UNDOCUMENTED}"   "${A_UNIREG_UNDOCUMENTED_LINE}"   false
     sdk_reachable "${A_DIED_UNRESTARTABLE}"      "${A_DIED_UNRESTARTABLE_LINE}"      false
     sdk_reachable "${A_DIED_IN_STARTUP}"         "${A_DIED_IN_STARTUP_LINE}"         false
     sdk_reachable "${A_DIED_AFTER_SST_FAILURE}"  "${A_DIED_AFTER_SST_FAILURE_LINE}"  false
@@ -512,6 +540,66 @@ fatal_signal_without_assert() {
     emit "fatal_signal" "\"signal\":${sig}"
 }
 
+# The [ERROR] lines logged before the LAST "[MY-010119] [Server] Aborting" of
+# the slice: the cause of a unireg_abort. The lines after it
+# ("Failed to shutdown components infrastructure", ...) are the teardown, not
+# the cause. With no Aborting line at all, every [ERROR] line of the slice.
+unireg_cause_lines() {
+    awk '
+        /\[MY-010119\] \[Server\] Aborting/ { kn = n; for (i = 0; i < n; i++) k[i] = b[i]; seen = 1; next }
+        /\[ERROR\]/ { b[n++] = $0 }
+        END {
+            if (!seen) { kn = n; for (i = 0; i < n; i++) k[i] = b[i] }
+            for (i = 0; i < kn; i++) print k[i]
+        }' <<< "$1"
+}
+
+# Property key for one unireg_abort cause, from the last [ERROR] before
+# Aborting: "MY-013183 [InnoDB]", or for MY-000000 the code plus the message
+# with addresses, UUIDs and long numbers normalized away.
+unireg_cause_key() {
+    local line="$1" code sub msg
+    if [[ ! "${line}" =~ \[ERROR\]\ \[(MY-[0-9]+)\]\ \[([^]]+)\]\ ?(.*)$ ]]; then
+        printf 'no [ERROR] line before exit'
+        return 0
+    fi
+    code="${BASH_REMATCH[1]}"; sub="${BASH_REMATCH[2]}"; msg="${BASH_REMATCH[3]}"
+    if [[ "${code}" != "MY-000000" ]]; then
+        printf '%s [%s]' "${code}" "${sub}"
+        return 0
+    fi
+    msg="$(sed -E -e 's#gcomm://[^ )]*#gcomm://...#g' \
+                  -e 's/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/<uuid>/g' \
+                  -e 's/[0-9]+(\.[0-9]+){3}(:[0-9]+)?/<ip>/g' \
+                  -e 's/[0-9]{3,}/N/g' <<< "${msg}" | cut -c1-120)"
+    printf '%s [%s] %s' "${code}" "${sub}" "${msg}"
+}
+
+# A unireg_abort whose cause is not on UNIREG_DOCUMENTED_CAUSES is a bug.
+# Sets BUG_DEATH=1 when it fires, so the coverage claims skip the boot.
+unireg_abort_undocumented() {
+    local slice="$1" cause window pat key details
+    [[ "${EXIT_KIND}" == "unireg_abort" ]] || return 0
+    cause="$(unireg_cause_lines "${slice}")"
+    # The cause chain is short and contiguous (5 lines for a gcomm connect
+    # failure); matching only the tail keeps an earlier, survived error
+    # (an SST that fell back to IST) from excusing a different stop.
+    window="$(tail -n 8 <<< "${cause}")"
+    for pat in "${UNIREG_DOCUMENTED_CAUSES[@]}"; do
+        [[ -n "${window}" ]] && grep -qE -- "${pat}" <<< "${window}" && return 0
+    done
+
+    key="$(unireg_cause_key "$(tail -n 1 <<< "${cause}")")"
+    details="$(printf '{"node":"%s","boot":%d,"status":%d,"kind":"%s","cause":"%s","last_errors":"%s"}' \
+        "${PXC_NODE_NAME}" "${BOOT_COUNT}" "${EXIT_STATUS}" "${EXIT_KIND}" \
+        "$(json_escape "${key}")" \
+        "$(json_escape "$(tail -n 5 <<< "${cause}" | cut -c1-240 | tr '\n' '|')")")"
+    BUG_DEATH=1
+    sdk_unreachable "${A_UNIREG_UNDOCUMENTED}" "${A_UNIREG_UNDOCUMENTED_LINE}" true "${details}"
+    sdk_unreachable "mysqld stopped itself after $(json_escape "${key}")" "${A_UNIREG_CAUSE_LINE}" true "${details}"
+    emit "unireg_abort_undocumented" "\"cause\":\"$(json_escape "${key}")\""
+}
+
 # Emit the death-class assertions for the boot that just ended.
 assert_death_class() {
     local status="$1"
@@ -532,11 +620,15 @@ assert_death_class() {
         sdk_unreachable "${A_FATAL_EXIT_UNDIAGNOSED}" "${A_FATAL_EXIT_UNDIAGNOSED_LINE}" true "${details}"
     fi
 
+    if (( BUG_DEATH == 0 )); then
+        unireg_abort_undocumented "${slice}"
+    fi
+
     # The four claims below are COVERAGE signals: they pass when seen, and
     # they say the workload drove a node through a documented death path (a
-    # failed SST, an inconsistency eviction, a unireg_abort a unit file would
-    # not restart). A death from a failed assertion or a fatal signal is a
-    # BUG. It is reported only by the Unreachables above, which fail when
+    # failed SST, an inconsistency eviction, a unireg_abort on the documented
+    # list). A death from a failed assertion, a fatal signal or an
+    # undocumented unireg_abort is a BUG. It is reported only by the Unreachables above, which fail when
     # seen. Before this gate, every assert abort also turned "a node died in
     # a way the shipped systemd unit would not restart" greener. That claim
     # passed with 460 examples in run c89f2f7a...-63-2, while 179 asserts

@@ -1,5 +1,11 @@
 # Validating the PXC Antithesis harness
 
+**Entry point: `bash antithesis/local-validate.sh`** (from the repo root). Add
+`--offline` where there is no container runtime. It runs every runtime-free
+check below, including the oracle tests, before the cluster phase, and stops
+early if one fails. The rest of this file is the record of what was checked
+and why. New checks belong in that script, not only in this file.
+
 **Status: the build and `snouty validate` steps below have NOT been run.**
 
 The harness was authored in a sandbox with no container runtime — `snouty

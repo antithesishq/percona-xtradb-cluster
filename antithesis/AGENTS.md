@@ -2,6 +2,24 @@ This directory contains files relevant to running tests in Antithesis.
 
 Use the `antithesis-setup` skill to scaffold and manage this directory. Use the `antithesis-research` skill to analyze the system and build a property catalog. Use the `antithesis-workload` skill to implement assertions and test commands. Use the `antithesis-launch` skill to build, validate, and submit Antithesis runs — do not run `snouty launch` directly.
 
+**Validate before every launch: `antithesis/local-validate.sh`**
+This is the single pre-launch validation entry point. Run it from the repo root
+(`percona-xtradb-cluster/`) before `snouty validate` / the `antithesis-launch`
+skill, and after any harness change.
+
+- `bash antithesis/local-validate.sh --offline` runs every check that needs no
+  container runtime: shell syntax, Python compile, test-template structure,
+  Dockerfile `COPY` sources, and the oracle tests. It takes seconds. Use it on
+  a machine with no runtime (like the harness development sandbox).
+- `bash antithesis/local-validate.sh [--build]` runs the same offline checks
+  first, stops if any fails, then brings the cluster up and runs every test
+  command.
+
+It writes one log (`local-validate-<stamp>.log`) and exits non-zero on any
+failure. New pre-launch checks go INTO this script (a step in
+`offline_checks`, or a section in `main`), not into a separate script an agent
+would have to know about.
+
 **snouty launch**
 Use `snouty launch --json --webhook basic_test --config antithesis/config` to start an Antithesis run. Always run `compose build` first to ensure images are up to date.
 
@@ -60,9 +78,10 @@ cataloging, so **assertion names must be inline constant string literals**.
 
 **oracle-tests/**
 Runtime-free detection tests for the assertion logic, run with
-`bash antithesis/oracle-tests/run.sh`. Run them after any change to
-`workload/pxcwl/checks.py`, `oracles.py`, `levers.py`, `probe.py` or
-`ddl.py`. They are detection tests: each one also feeds the *old, broken*
+`bash antithesis/oracle-tests/run.sh`, and run automatically by
+`local-validate.sh`. Run them after any change to
+`workload/pxcwl/checks.py`, `oracles.py`, `levers.py`, `probe.py`,
+`ddl.py` or `pxc-node/entrypoint.sh`. They are detection tests: each one also feeds the *old, broken*
 behaviour to the same checker and requires it to be caught, so a green result
 distinguishes a working oracle from a blind one — which a smoke test does not.
 See `oracle-tests/README.md`.

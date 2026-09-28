@@ -1,7 +1,17 @@
 #!/usr/bin/env bash
 #
-# Bring up the PXC harness locally, run every test command the way Antithesis
-# would, and write ONE self-contained log for an agent to triage.
+# THE one place to validate the harness before launching in Antithesis. Runs,
+# in order, and writes ONE self-contained log for an agent to triage:
+#
+#   1. Offline checks, no container runtime needed: shell syntax, Python
+#      compile, test-template structure, Dockerfile COPY sources, and the
+#      oracle tests (antithesis/oracle-tests/run.sh). A failure here stops the
+#      run before the slow cluster phase.
+#   2. The cluster phase: bring up the harness locally and run every test
+#      command the way Antithesis would.
+#
+# Add a new pre-launch check HERE (as a step in offline_checks, or a new
+# section in main) rather than as a separate script an agent has to know about.
 #
 # Why one file: the previous local run lost the two things that mattered most.
 # `docker compose exec` writes to your terminal and NOT to the attached compose
@@ -16,8 +26,11 @@
 # THIS FILE" at the top of the log for the one filter that separates them.
 #
 # Usage:
-#   ./antithesis/local-validate.sh [--build] [--keep] [--rounds N] [--out FILE]
+#   ./antithesis/local-validate.sh [--offline] [--build] [--keep] [--rounds N] [--out FILE]
 #
+#   --offline    run only the offline checks (phase 1). Use this on a machine
+#                with no container runtime; it still needs bash, python3, awk
+#                and jq
 #   --build      rebuild images first (the pxc-node stage compiles PXC and
 #                galera from source and is very slow; omit to reuse what you
 #                already have)
@@ -25,17 +38,18 @@
 #   --rounds N   driver/probe rounds to run (default 3)
 #   --out FILE   log path (default ./local-validate-<utc stamp>.log)
 #
-# Exits non-zero if any test command did.
+# Exits non-zero if any offline check or test command did.
 
 set -uo pipefail
 
-HELP_LINES='2,28p'
+HELP_LINES='2,41p'
 
 # --------------------------------------------------------------------------
 # Arguments. Parsed before anything is printed, because --out decides where
 # the output goes.
 # --------------------------------------------------------------------------
 
+DO_OFFLINE=0
 DO_BUILD=0
 DO_KEEP=0
 ROUNDS=3
@@ -44,6 +58,7 @@ INVOKED_FROM="$PWD"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --offline) DO_OFFLINE=1; shift ;;
         --build)  DO_BUILD=1; shift ;;
         --keep)   DO_KEEP=1; shift ;;
         --rounds) ROUNDS="${2:?--rounds needs a number}"; shift 2 ;;
@@ -76,16 +91,19 @@ cd "$ROOT" || exit 1
 exec > >(tee -a "$OUT") 2>&1
 
 # Pick a compose implementation, and the engine binary that goes with it.
-if docker compose version >/dev/null 2>&1; then
-    COMPOSE=(docker compose -f "$COMPOSE_FILE"); ENGINE=docker
-elif command -v docker-compose >/dev/null 2>&1; then
-    COMPOSE=(docker-compose -f "$COMPOSE_FILE"); ENGINE=docker
-elif podman compose version >/dev/null 2>&1; then
-    COMPOSE=(podman compose -f "$COMPOSE_FILE"); ENGINE=podman
-else
-    echo "no docker compose / docker-compose / podman compose on PATH" >&2
-    exit 1
-fi
+# Called only for the cluster phase, so --offline works with no runtime.
+COMPOSE=(); ENGINE=""
+pick_compose() {
+    if docker compose version >/dev/null 2>&1; then
+        COMPOSE=(docker compose -f "$COMPOSE_FILE"); ENGINE=docker
+    elif command -v docker-compose >/dev/null 2>&1; then
+        COMPOSE=(docker-compose -f "$COMPOSE_FILE"); ENGINE=docker
+    elif podman compose version >/dev/null 2>&1; then
+        COMPOSE=(podman compose -f "$COMPOSE_FILE"); ENGINE=podman
+    else
+        return 1
+    fi
+}
 
 TESTDIR=/opt/antithesis/test/v1/pxc
 SDKDIR=/tmp/sdk                    # one assertion stream per invocation
@@ -212,6 +230,83 @@ test_cmd() {
 MYSQL="/usr/local/pxc/bin/mysql -uroot --protocol=socket --socket=/var/lib/mysql/mysql.sock"
 
 # --------------------------------------------------------------------------
+# Phase 1: offline checks. Everything here runs from the source tree, with no
+# image and no container runtime, in seconds. Each is a `step`, so it counts
+# toward the exit status.
+# --------------------------------------------------------------------------
+
+SHELL_SCRIPTS=(antithesis/pxc-node/entrypoint.sh antithesis/pxc-node/notify.sh
+               antithesis/setup-complete.sh antithesis/build/patch-sources.sh
+               antithesis/local-validate.sh)
+
+check_shell_syntax() {
+    local f rc=0
+    for f in "${SHELL_SCRIPTS[@]}"; do
+        if bash -n "$f"; then echo "ok    $f"; else echo "FAIL  $f"; rc=1; fi
+    done
+    return $rc
+}
+
+check_python_compile() {
+    # Test commands have no .py suffix, so they are compiled by path.
+    local rc=0 f
+    while IFS= read -r f; do
+        # compile() only parses: no .pyc lands in the tree.
+        if python3 -c 'import sys; compile(open(sys.argv[1]).read(), sys.argv[1], "exec")' "$f"; then
+            echo "ok    $f"
+        else
+            echo "FAIL  $f"; rc=1
+        fi
+    done < <(find antithesis/workload -name '*.py' -not -path '*/__pycache__/*' | sort; ls -1 antithesis/test/pxc/*)
+    return $rc
+}
+
+# The template rules Antithesis enforces at run time, checked from the tree:
+# a recognized prefix, the executable bit, and the venv shebang the workload
+# image creates.
+check_test_template() {
+    local f base rc=0
+    for f in antithesis/test/pxc/*; do
+        base="$(basename "$f")"
+        [[ "$base" == helper_* ]] && continue
+        if [[ ! "$base" =~ ^(parallel_driver_|singleton_driver_|serial_driver_|first_|eventually_|finally_|anytime_) ]]; then
+            echo "FAIL  $f: no valid command prefix"; rc=1; continue
+        fi
+        if [[ ! -x "$f" ]]; then echo "FAIL  $f: not executable"; rc=1; continue; fi
+        if [[ "$(head -1 "$f")" != "#!/opt/antithesis/venv/bin/python3" ]]; then
+            echo "FAIL  $f: shebang is not the workload venv"; rc=1; continue
+        fi
+        echo "ok    $f"
+    done
+    return $rc
+}
+
+# Every harness file the Dockerfile COPYs must exist, or the build fails late.
+check_copy_sources() {
+    local src rc=0
+    while read -r src; do
+        if [[ -e "$src" ]]; then echo "ok    $src"; else echo "FAIL  $src missing"; rc=1; fi
+    done < <(grep -E '^COPY[[:space:]]+antithesis/' antithesis/Dockerfile | awk '{print $2}' | sort -u)
+    return $rc
+}
+
+offline_checks() {
+    section "offline checks (no container runtime needed)"
+    step "offline:shell-syntax"    check_shell_syntax
+    if command -v shellcheck >/dev/null 2>&1; then
+        step "offline:shellcheck"  shellcheck -S warning "${SHELL_SCRIPTS[@]}"
+    else
+        note "shellcheck not installed; skipped"
+    fi
+    step "offline:python-compile"  check_python_compile
+    step "offline:test-template"   check_test_template
+    step "offline:copy-sources"    check_copy_sources
+    # Detection tests for the workload oracles and the supervisor's death
+    # classification. See antithesis/oracle-tests/README.md.
+    step "offline:oracle-tests"    bash antithesis/oracle-tests/run.sh
+}
+
+# --------------------------------------------------------------------------
 
 main() {
 
@@ -219,12 +314,9 @@ section "run metadata"
 
 echo "started:   $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "host:      $(uname -srm)"
-echo "compose:   ${COMPOSE[*]}"
-echo "engine:    $ENGINE"
 echo "root:      $ROOT"
 echo "log:       $OUT"
-echo "rounds:    $ROUNDS   build: $DO_BUILD   keep: $DO_KEEP"
-"${COMPOSE[@]}" version 2>&1 | head -3
+echo "offline:   $DO_OFFLINE   rounds: $ROUNDS   build: $DO_BUILD   keep: $DO_KEEP"
 note "source revision"
 git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo "(not a git checkout)"
 git -C "$ROOT" status --porcelain 2>/dev/null | head -40
@@ -251,6 +343,38 @@ cat <<'LAYOUT'
       sed -n '/^----- BEGIN cmd:seed /,/^----- END cmd:seed /p' LOG \
         | grep -vE '^[A-Za-z0-9_.-]+[[:space:]]*\|[[:space:]]'
 LAYOUT
+
+offline_checks
+
+if [[ $DO_OFFLINE -eq 1 ]]; then
+    section "summary"
+    printf '%s\n' "${RESULTS[@]}"
+    echo
+    echo "finished:  $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "log:       $OUT"
+    if [[ $FAILED -eq 0 ]]; then
+        echo "overall:   every offline check passed"
+    else
+        echo "overall:   AT LEAST ONE OFFLINE CHECK FAILED"
+    fi
+    echo "--offline: the cluster phase did not run. It still has to, somewhere"
+    echo "           with a container runtime, before snouty validate / launch."
+    return $FAILED
+fi
+
+if [[ $FAILED -ne 0 ]]; then
+    section "ABORT: offline checks failed; fix them before the cluster phase"
+    printf '%s\n' "${RESULTS[@]}"
+    return 1
+fi
+
+if ! pick_compose; then
+    section "ABORT: no docker compose / docker-compose / podman compose on PATH"
+    note "rerun with --offline to run only the checks that need no runtime"
+    return 1
+fi
+note "compose: ${COMPOSE[*]}   engine: $ENGINE"
+"${COMPOSE[@]}" version 2>&1 | head -3
 
 section "bring up the cluster"
 

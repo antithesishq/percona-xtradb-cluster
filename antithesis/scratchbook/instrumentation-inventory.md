@@ -173,10 +173,35 @@ path without a diagnosable log line` fails on any boot that exited with status
 2 (mysqld's fatal-signal handler, or the GTID out-of-memory `_exit`), on
 SIGABRT, or on any signal the harness did not send, i.e. anything but SIGKILL
 (kill channel) or SIGTERM (container stop), when neither parser found an assert
-or `got signal` line. Still not caught as bugs:
-- **`unireg_abort` (exit 1):** 150 in `c89f2f7a`. Mostly documented, such as a
-  failed SST as joiner, an inconsistency eviction, or being unable to reach the
-  cluster. It still needs a cause allowlist before an undocumented one can fail.
+or `got signal` line.
+
+**`unireg_abort` (exit 1), covered 2026-09-28 (unbuilt).** mysqld stopped
+itself after logging an `[ERROR]`. The supervisor takes the `[ERROR]` lines
+before the boot's last `[MY-010119] [Server] Aborting` (the lines after it are
+teardown, e.g. `MY-010065 Failed to shutdown components infrastructure`) and
+matches the last 8 against `UNIREG_DOCUMENTED_CAUSES` in `entrypoint.sh`. Each
+pattern there carries a source citation. A match stays coverage: only the four
+reach claims fire. No match emits two `Unreachable`s and sets `BUG_DEATH=1`:
+
+- `mysqld never stops itself for an undocumented reason`: declared at startup.
+- `mysqld stopped itself after <key>`: one per cause. The key is the MY-code
+  and subsystem of the last `[ERROR]` before Aborting (`MY-012981 [InnoDB]`).
+  Every Galera and WSREP line logs `MY-000000`, so for that code alone the key
+  also carries the message, with addresses, UUIDs and 3+ digit numbers
+  normalized. An exit 1 with no `[ERROR]` is keyed `no [ERROR] line before exit`.
+
+The details carry node, boot, the key, and the last 5 cause lines.
+
+The allowlist holds one cause: `failed to reach primary view
+(pc.wait_prim_timeout)`. It is the only cause observed. All 150 exits in
+`c89f2f7a…-63-2` and all 848 in `93ec5045…-63-2` show this chain (994
+`Aborting` lines fetched and read; neither count hit the 999 search cap). A
+failed joiner SST and an inconsistency eviction are not on the list, because
+they do not exit 1. Galera ends both with `abort()` (`replicator_str.cpp`,
+`gcs_group.cpp:1379,1388` "Need to abort"), which lands in the signal/status-2
+classes above. Tested offline by `oracle-tests/test_unireg_abort_cause.py`.
+
+Still not caught as bugs:
 - **SIGKILL from the kernel OOM killer:** indistinguishable from the kill
   channel by exit status alone.
 - **Crashes in the side mysqld runs** (`--wsrep-recover`, `--initialize`): their

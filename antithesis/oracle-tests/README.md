@@ -1,14 +1,20 @@
 # Oracle tests
 
-Runtime-free tests for the assertion logic in `workload/pxcwl/`. Run them after
-any change to `checks.py`, `oracles.py`, `levers.py`, `probe.py` or `ddl.py`:
+Runtime-free tests for the assertion logic in `workload/pxcwl/` and the
+supervisor's death classification. Run them after any change to `checks.py`,
+`oracles.py`, `levers.py`, `probe.py`, `ddl.py` or `pxc-node/entrypoint.sh`:
 
 ```
 bash antithesis/oracle-tests/run.sh
 ```
 
+`antithesis/local-validate.sh` runs them as its `offline:oracle-tests` step
+(with `--offline`, or before the cluster phase), so the normal pre-launch
+check covers them. A new test needs no wiring beyond the `test_*.py` name.
+
 They exist because there is no container runtime on the harness development
-machine, so `snouty validate` and `local-validate.sh` cannot run here — and
+machine, so `snouty validate` and the cluster phase of `local-validate.sh`
+cannot run here — and
 because a green run proves much less than it looks like it does. These are
 **detection** tests: each one injects the real failure — a divergence, a wedged
 node, or a statement the server would reject — and asserts it is caught,
@@ -32,4 +38,5 @@ touches the PXC compile cache.
 | `test_ddl_direction.py` | The DDL generator reads the catalog and emits only the direction that is legal, exercises both, and emits nothing at all when the lookup fails or the table is momentarily absent. The last case feeds the old coin-flip generator to the same model, which must reject it — otherwise "no invalid statements" would not distinguish a fixed generator from a blind model. |
 | `test_ddl_concurrent_drivers.py` | Four concurrent drivers on three nodes whose catalog views lag an authoritative, totally ordered one emit no statement TOI would reject. That rests on `ddl._scratch_lock` and on the causal (`wsrep_sync_wait` READ bit) lookup, whose session level is restored afterwards. Detection: without both fixes the model catches 100+ invalid statements. The race and the stale node are each shown to need their own fix: the lock-less run still races, and a node kept nine statements behind emits invalid DDL without the causal read. |
 | `test_triage_false_positives.py` | The four false positives from run `5aa4afb5-63-0`, each replayed and required to stay silent beside the real failure, which must still be caught: `applier_resize` gives no verdict on a node that is disconnected or out of Synced, but a Synced pool stuck below its setpoint is still caught; a COMMIT failing 1105/1205/1317 is UNKNOWN, while 1213/1062 and statement-time errors stay FAILED; a FAILED-but-present row carries its journal shape/errno/phase; terminal `pc.bootstrap` happens only when no node is Primary, every unreachable node is down (not timed out) and inside the reachable nodes' component, the chosen node is not behind the probe ledger's high-water mark, and the condition holds across two samples and a final re-check; `Session.ensure` applies every SET after a rejected one. |
+| `test_unireg_abort_cause.py` | Supervisor, not workload: the `unireg_abort` classification in `pxc-node/entrypoint.sh`, with its functions extracted by awk and fed the cause chain of a real boot from run `c89f2f7a…-63-2`, inlined verbatim in the test. The documented `pc.wait_prim_timeout` stop emits only the coverage Reachables. A stop without it, an InnoDB stop, a documented line appearing only after `Aborting`, and a silent exit 1 each fail the umbrella and a per-cause Unreachable, and skip the coverage claims. Every emitted line parses with `jq`. Detection: with the check stubbed out, the undocumented stop turns coverage green instead. |
 | `test_assertion_catalog.py` | Replicates the platform's static scan: every assertion name is an inline literal and unique. An assertion whose name is built at runtime is invisible to the catalog rather than failing loudly. |
