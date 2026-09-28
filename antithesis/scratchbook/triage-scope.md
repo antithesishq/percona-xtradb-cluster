@@ -99,15 +99,24 @@ unfired claim still reports):
 | `a node died in a boot whose state transfer had failed` | the boot's log slice shows an SST failure |
 | `a node died after the cluster declared it inconsistent` | the boot's log slice shows `Inconsistency detected` |
 
+**These four are coverage signals and pass when seen.** Since 2026-09-28 they
+skip any boot that ended in a failed assertion or a fatal signal. Those deaths
+are bugs, reported instead by the `Unreachable`s `mysqld assertion failed at
+<file>:<line>` and `mysqld died on fatal signal <N> without a failed assertion`,
+which fail when seen. Before that gate, every assert abort also turned the
+"would not restart" claim greener (460 passes in `c89f2f7a…-63-2`).
+
 All four carry `node`, `boot`, `kind`, `status`, `field_would_restart`,
 `reached_ready`, `sst_failed`, `inconsistent` and `last_error` — the last being
 the final `[ERROR]` line of that boot, which is how you tell a diagnosed death
 from a silent one without a pattern list deciding the verdict.
 
 The surviving-node half is in the workload (`probe.py` `_claim_error_log`, via
-`performance_schema.error_log`): `a state transfer failed on a node that kept
-serving`, `a failed state transfer fell back to IST instead of killing the node`,
-and `a node was declared inconsistent and was still serving`. The two halves
+`performance_schema.error_log`): `a live node's error log recorded a failed
+state transfer`, `a failed state transfer fell back to IST instead of killing
+the node`, and `a live node's error log recorded an inconsistency verdict`.
+Before 2026-09-28 the first and last were named "…kept serving" and "…was still
+serving". The new names describe what is observed. The two halves
 cover each other's blind spot — the supervisor cannot see a node that survives,
 and the workload cannot query one that died.
 

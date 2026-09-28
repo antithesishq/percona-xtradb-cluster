@@ -133,3 +133,52 @@ channel. See `antithesis/pxc-node/entrypoint.sh`.
 | `nm ... \| grep antithesis_load_libvoidstar` | **will not match in v1** — expected |
 | `Software was instrumented` in first triage report | **will NOT appear for pxc-node** — expected, not a regression |
 | Local `compose build` + `snouty validate` | ⚠️ **NOT RUN** — no container runtime in the authoring sandbox; see `antithesis/VALIDATION.md` |
+
+## Addendum 2026-09-28: server asserts as named properties
+
+Until now every `assert()` abort surfaced only in the platform's generic
+"No unexpected crashes → `mysqld`" group. Run `c89f2f7a…-63-2` had 76 of them
+across 16 sites, with no site named in the report. The supervisor now parses
+each non-graceful boot's error log slice for the fatal assert, in both forms:
+glibc's `mysqld: FILE:LINE: FUNC: Assertion `EXPR' failed.` and InnoDB's
+`Assertion failure: FILE:LINE:EXPR`. It emits two fallback-SDK `Unreachable`
+properties:
+
+- `mysqld never aborts on a failed assertion`: declared at startup, so it
+  shows passing when nothing aborts.
+- `mysqld assertion failed at <file>:<line>`: one per site, built at run time.
+  This is the one deliberate exception to the inline-constant id rule. An
+  undeclared Unreachable loses nothing, because absent and passing mean the
+  same, and the platform evaluates undeclared assertions on first sight.
+
+`/src/` is stripped so server and Galera paths key the same way. The details
+carry node, boot, function, expression, and a path-only `component` hint
+(galera / wsrep-lib / pxc-wsrep / server). The hint does not replace the
+by-caller rule in `triage-scope.md`.
+
+**Why the platform's crash count was low (76 against 179 assert lines).**
+mysqld's `handle_fatal_signal` (`sql/signal_handler.cc`) catches the SIGABRT
+that `assert()` raises, prints a backtrace, and calls `_exit(2)`. The kernel
+sees a normal exit with status 2, so a crash detector that counts deaths by
+signal misses most of them. In `c89f2f7a…-63-2` the supervisor recorded 213
+status-2 exits and 96 SIGABRT (134) exits, plus 150 `unireg_abort` (1). The
+supervisor therefore also emits
+`mysqld died on fatal signal <N> without a failed assertion` (plus a declared
+umbrella) when a boot's log has `mysqld got signal N` but no assert line. That
+case covers SIGSEGV and expression-less aborts. The run had 219 `got signal 6`
+lines, 179 assert lines, and 2 `got signal 11`.
+
+**Catch-all, and what still is not caught.** `mysqld never dies on a fatal
+path without a diagnosable log line` fails on any boot that exited with status
+2 (mysqld's fatal-signal handler, or the GTID out-of-memory `_exit`), on
+SIGABRT, or on any signal the harness did not send, i.e. anything but SIGKILL
+(kill channel) or SIGTERM (container stop), when neither parser found an assert
+or `got signal` line. Still not caught as bugs:
+- **`unireg_abort` (exit 1):** 150 in `c89f2f7a`. Mostly documented, such as a
+  failed SST as joiner, an inconsistency eviction, or being unable to reach the
+  cluster. It still needs a cause allowlist before an undocumented one can fail.
+- **SIGKILL from the kernel OOM killer:** indistinguishable from the kill
+  channel by exit status alone.
+- **Crashes in the side mysqld runs** (`--wsrep-recover`, `--initialize`): their
+  logs are not scanned.
+- **Hangs:** these are not crashes, and are left to the liveness oracles.

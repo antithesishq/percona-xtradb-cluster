@@ -206,13 +206,19 @@ def saw_state_transfer(details: Details) -> None:
 
 
 def saw_failed_state_transfer(details: Details) -> None:
-    """The failure side of the transfer path.
+    """The failure side of the transfer path. A COVERAGE signal: it passes when seen.
 
     ``saw_state_transfer`` only ever fires on success, so without this the
     report cannot distinguish "SST worked every time" from "SST failed and the
     node died before anyone asked".
+
+    Named for what it observes: the node answered the probe, and its error
+    log holds a failed-transfer line. It used to be called "...on a node that
+    kept serving", which reads like a bug and would have to FAIL when seen.
+    Staying up after a failed SST is documented, though. The bug-shaped
+    question -- does such a node commit client writes? -- is not checked yet.
     """
-    reachable("a state transfer failed on a node that kept serving", details)
+    reachable("a live node's error log recorded a failed state transfer", details)
 
 
 def saw_ist_fallback(details: Details) -> None:
@@ -229,10 +235,14 @@ def saw_ist_fallback(details: Details) -> None:
 def saw_inconsistency_verdict(details: Details) -> None:
     """A node the cluster (or the node itself) judged inconsistent, still up.
 
-    Attribution for the terminal liveness oracles: when reconvergence goes red,
-    this says whether an inconsistency verdict is why.
+    A COVERAGE signal, and attribution for the terminal liveness oracles: when
+    reconvergence goes red, this says whether an inconsistency verdict is why.
+    Renamed from "...and was still serving" for the same reason as
+    saw_failed_state_transfer: PXC keeps an evicted node running by design,
+    so being up is not the bug. Committing client writes would be, and that
+    is not checked yet.
     """
-    reachable("a node was declared inconsistent and was still serving", details)
+    reachable("a live node's error log recorded an inconsistency verdict", details)
 
 
 # ==========================================================================

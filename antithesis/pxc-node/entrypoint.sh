@@ -60,6 +60,9 @@ BOOT_COUNT=0
 # Error log line count at the start of the current boot, so a death is judged
 # only on the log this boot produced.
 BOOT_LOG_OFFSET=0
+# Set by assert_failed_site: 1 when this boot's death was a failed assertion
+# or a fatal signal, i.e. a bug rather than a documented death path.
+BUG_DEATH=0
 EXIT_STATUS=0
 EXIT_KIND=""
 EXIT_SIGNAL=0
@@ -126,6 +129,35 @@ A_DIED_AFTER_SST_FAILURE_LINE=3
 A_DIED_INCONSISTENT="a node died after the cluster declared it inconsistent"
 A_DIED_INCONSISTENT_LINE=4
 
+# The server's own invariants, as properties. Until these existed, every
+# assert() abort landed in the platform's generic "No unexpected crashes ->
+# mysqld" group: one red for 14 distinct crash sites, none of them named in
+# the report. Two tiers:
+#   - one declared umbrella, so a run with no abort shows it passing rather
+#     than absent;
+#   - one property per assert SITE (file:line), built at run time. The rule
+#     that ids must be inline constants exists for claims that have to be
+#     cataloged to be reported unfired. An Unreachable does not: absent and
+#     passing mean the same thing, and the platform evaluates an undeclared
+#     assertion the first time it sees it. Keying on file:line is what lets a
+#     report say gcs_node.cpp:224 x41 instead of "mysqld x76".
+A_ASSERT_ANY="mysqld never aborts on a failed assertion"
+A_ASSERT_ANY_LINE=5
+A_ASSERT_SITE_LINE=6
+
+A_FATAL_SIGNAL_ANY="mysqld never dies on a fatal signal outside a failed assertion"
+A_FATAL_SIGNAL_ANY_LINE=7
+A_FATAL_SIGNAL_LINE=8
+
+# Catch-all keyed on HOW mysqld exited, not on what it logged: exit status 2
+# (mysqld's own fatal-signal handler, or the GTID out-of-memory _exit), or a
+# death by any signal the harness did not send itself. The harness sends
+# SIGKILL (the workload kill channel) and SIGTERM (container stop), so those
+# two are excluded. This is what makes "every crash fails a property" hold
+# even when the log slice has no parsable line.
+A_FATAL_EXIT_UNDIAGNOSED="mysqld never dies on a fatal path without a diagnosable log line"
+A_FATAL_EXIT_UNDIAGNOSED_LINE=9
+
 # Minimal JSON string escaping. The payload is one line of mysqld error log,
 # which routinely contains quotes, backslashes and stray control bytes.
 json_escape() {
@@ -142,8 +174,22 @@ sdk_reachable() {
         >> "${SDK_FILE}"
 }
 
+# $1 id/message  $2 nominal line  $3 hit (true|false)  $4 details JSON or ""
+# Unreachable: must_hit false, and condition false both declared and on hit.
+sdk_unreachable() {
+    local id="$1" line="$2" hit="$3" details="${4:-}"
+    [[ -n "${SDK_FILE}" ]] || return 0
+    mkdir -p "$(dirname "${SDK_FILE}")" 2>/dev/null || true
+    printf '{"antithesis_assert":{"hit":%s,"must_hit":false,"assert_type":"reachability","display_type":"Unreachable","condition":false,"id":"%s","message":"%s","location":{"class":"","function":"supervisor","file":"antithesis/pxc-node/entrypoint.sh","begin_line":%s,"begin_column":0}%s}}\n' \
+        "${hit}" "${id}" "${id}" "${line}" "${details:+,\"details\":${details}}" \
+        >> "${SDK_FILE}"
+}
+
 # Declare every assertion in the catalog. Runs once, before the restart loop.
 sdk_declare_catalog() {
+    sdk_unreachable "${A_ASSERT_ANY}"            "${A_ASSERT_ANY_LINE}"            false
+    sdk_unreachable "${A_FATAL_SIGNAL_ANY}"      "${A_FATAL_SIGNAL_ANY_LINE}"      false
+    sdk_unreachable "${A_FATAL_EXIT_UNDIAGNOSED}" "${A_FATAL_EXIT_UNDIAGNOSED_LINE}" false
     sdk_reachable "${A_DIED_UNRESTARTABLE}"      "${A_DIED_UNRESTARTABLE_LINE}"      false
     sdk_reachable "${A_DIED_IN_STARTUP}"         "${A_DIED_IN_STARTUP_LINE}"         false
     sdk_reachable "${A_DIED_AFTER_SST_FAILURE}"  "${A_DIED_AFTER_SST_FAILURE_LINE}"  false
@@ -380,6 +426,92 @@ boot_log_slice() {
     tail -n +$(( BOOT_LOG_OFFSET + 1 )) "${LOG_ERROR}" 2>/dev/null
 }
 
+# Which code base a crash site sits in, by path alone. This is a hint for
+# triage, not the ownership verdict: an assert inside an upstream file is
+# still Percona's when a wsrep_* frame put it there (scratchbook/
+# triage-scope.md classifies by caller, which needs the backtrace).
+site_component() {
+    case "$1" in
+        gcs/*|galera/*|galerautils/*|gcache/*|gcomm/*) printf 'galera' ;;
+        wsrep-lib/*)                                   printf 'wsrep-lib' ;;
+        sql/wsrep*|storage/innobase/*wsrep*)           printf 'pxc-wsrep' ;;
+        *)                                             printf 'server' ;;
+    esac
+}
+
+# True when the exit itself says mysqld died on a fatal path.
+fatal_exit_status() {
+    [[ "${EXIT_KIND}" == "exit" && "${EXIT_STATUS}" -eq 2 ]] && return 0
+    [[ "${EXIT_KIND}" == "abort" ]] && return 0
+    [[ "${EXIT_KIND}" == "crash" && "${EXIT_SIGNAL}" -ne 9 && "${EXIT_SIGNAL}" -ne 15 ]] && return 0
+    return 1
+}
+
+# One failed-assertion property per crash site, for the boot that just ended.
+# Recognizes the two forms the build emits:
+#   mysqld: FILE:LINE: FUNC: Assertion `EXPR' failed.        (glibc assert)
+#   [InnoDB] Assertion failure: FILE:LINE:EXPR               (ut_a / ut_ad)
+# Only the FIRST in the boot is the one that killed it; later lines are
+# noise from the dying process.
+assert_failed_site() {
+    local slice="$1" hit file line func expr site component details
+    BUG_DEATH=0
+    hit="$(grep -m1 -E "^mysqld: [^:]+:[0-9]+: .*: Assertion \`.*' failed\.|\[InnoDB\] Assertion failure: [^:]+:[0-9]+" <<< "${slice}")"
+    if [[ -z "${hit}" ]]; then
+        fatal_signal_without_assert "${slice}"
+        return 0
+    fi
+
+    if [[ "${hit}" =~ ^mysqld:\ ([^:]+):([0-9]+):\ (.*):\ Assertion\ \`(.*)\'\ failed\.$ ]]; then
+        file="${BASH_REMATCH[1]}"; line="${BASH_REMATCH[2]}"
+        func="${BASH_REMATCH[3]}"; expr="${BASH_REMATCH[4]}"
+    elif [[ "${hit}" =~ Assertion\ failure:\ ([^:]+):([0-9]+):?(.*)$ ]]; then
+        file="${BASH_REMATCH[1]}"; line="${BASH_REMATCH[2]}"
+        func=""; expr="${BASH_REMATCH[3]}"
+        expr="${expr%% thread [0-9]*}"
+    else
+        return 0
+    fi
+    # Server-tree asserts print an absolute build path (/src/...), Galera's a
+    # relative one. Normalize, or the same site splits into two properties.
+    file="${file#/src/}"
+    site="${file}:${line}"
+    component="$(site_component "${file}")"
+
+    details="$(printf '{"node":"%s","boot":%d,"site":"%s","component":"%s","function":"%s","expression":"%s","exit_status":%d,"kind":"%s","log_line":"%s"}' \
+        "${PXC_NODE_NAME}" "${BOOT_COUNT}" "$(json_escape "${site}")" "${component}" \
+        "$(json_escape "${func}")" "$(json_escape "${expr}")" "${EXIT_STATUS}" "${EXIT_KIND}" \
+        "$(json_escape "$(cut -c1-400 <<< "${hit}")")")"
+
+    BUG_DEATH=1
+    sdk_unreachable "${A_ASSERT_ANY}" "${A_ASSERT_ANY_LINE}" true "${details}"
+    sdk_unreachable "mysqld assertion failed at $(json_escape "${site}")" "${A_ASSERT_SITE_LINE}" true "${details}"
+    emit "assertion_failed" "\"site\":\"$(json_escape "${site}")\",\"component\":\"${component}\""
+}
+
+# A fatal signal with no assert line: SIGSEGV, or an abort() that printed no
+# expression (gu_abort, my_abort). Run c89f2f7a...-63-2 had 219
+# "got signal 6" against 179 assert lines, plus two SIGSEGVs. mysqld's own
+# handler turns every one of these into _exit(2) (signal_handler.cc), so the
+# platform's crash detector, which counts deaths BY signal, never sees them.
+# The status-2 exits outnumbered the SIGABRT ones 213 to 96. The id is keyed
+# on the signal, because there is no site to key on.
+fatal_signal_without_assert() {
+    local slice="$1" hit sig details
+    hit="$(grep -m1 -E 'mysqld got (signal|exception) [0-9]+' <<< "${slice}")"
+    [[ -n "${hit}" ]] || return 0
+    [[ "${hit}" =~ got\ (signal|exception)\ ([0-9]+) ]] || return 0
+    sig="${BASH_REMATCH[2]}"
+    details="$(printf '{"node":"%s","boot":%d,"signal":%d,"exit_status":%d,"kind":"%s","log_line":"%s","last_error":"%s"}' \
+        "${PXC_NODE_NAME}" "${BOOT_COUNT}" "${sig}" "${EXIT_STATUS}" "${EXIT_KIND}" \
+        "$(json_escape "$(cut -c1-300 <<< "${hit}")")" \
+        "$(json_escape "$(grep -F '[ERROR]' <<< "${slice}" | tail -n 1 | cut -c1-300)")")"
+    BUG_DEATH=1
+    sdk_unreachable "${A_FATAL_SIGNAL_ANY}" "${A_FATAL_SIGNAL_ANY_LINE}" true "${details}"
+    sdk_unreachable "mysqld died on fatal signal ${sig} without a failed assertion" "${A_FATAL_SIGNAL_LINE}" true "${details}"
+    emit "fatal_signal" "\"signal\":${sig}"
+}
+
 # Emit the death-class assertions for the boot that just ended.
 assert_death_class() {
     local status="$1"
@@ -389,6 +521,29 @@ assert_death_class() {
     [[ "${EXIT_KIND}" == "graceful" ]] && return 0
 
     slice="$(boot_log_slice)"
+
+    assert_failed_site "${slice}"
+
+    if (( BUG_DEATH == 0 )) && fatal_exit_status; then
+        BUG_DEATH=1
+        details="$(printf '{"node":"%s","boot":%d,"kind":"%s","status":%d,"signal":%d,"last_lines":"%s"}' \
+            "${PXC_NODE_NAME}" "${BOOT_COUNT}" "${EXIT_KIND}" "${status}" "${EXIT_SIGNAL}" \
+            "$(json_escape "$(tail -n 8 <<< "${slice}" | cut -c1-200 | tr '\n' '|')")")"
+        sdk_unreachable "${A_FATAL_EXIT_UNDIAGNOSED}" "${A_FATAL_EXIT_UNDIAGNOSED_LINE}" true "${details}"
+    fi
+
+    # The four claims below are COVERAGE signals: they pass when seen, and
+    # they say the workload drove a node through a documented death path (a
+    # failed SST, an inconsistency eviction, a unireg_abort a unit file would
+    # not restart). A death from a failed assertion or a fatal signal is a
+    # BUG. It is reported only by the Unreachables above, which fail when
+    # seen. Before this gate, every assert abort also turned "a node died in
+    # a way the shipped systemd unit would not restart" greener. That claim
+    # passed with 460 examples in run c89f2f7a...-63-2, while 179 asserts
+    # showed nowhere else in the report.
+    if (( BUG_DEATH == 1 )); then
+        return 0
+    fi
 
     reached_ready=false
     grep -qF 'ready for connections' <<< "${slice}" && reached_ready=true
