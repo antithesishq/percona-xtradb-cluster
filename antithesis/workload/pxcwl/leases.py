@@ -22,7 +22,7 @@ from __future__ import annotations
 import sqlite3
 import time
 
-from . import config, db
+from . import config, db, events
 
 # Levers that change cluster availability. At most one at a time, cluster-wide,
 # and only when all nodes are currently Synced.
@@ -150,6 +150,22 @@ def repair_expired(jr, *, force_all: bool = False) -> list[dict[str, object]]:
     repaired: list[dict[str, object]] = []
     for row in rows:
         ok = _apply_restore(row["lever"], row["node"], row["restore"])
+        # A repair is the end of a lever whose holder never got to release it
+        # (killed by eventually_, or overran its deadline). Without this event,
+        # such a lever would appear to stay applied for the rest of the log.
+        events.emit(
+            "pxc_lever",
+            {
+                "phase": "repair",
+                "lever": row["lever"],
+                "node": row["node"],
+                "restore": row["restore"],
+                "restored": ok,
+                "holder_inv_id": row["inv_id"],
+                "inv_id": jr.inv_id,
+                "by": getattr(jr, "kind", None),
+            },
+        )
         if ok:
             with jr.conn:
                 jr.conn.execute("DELETE FROM lease WHERE lever = ?", (row["lever"],))
@@ -222,6 +238,25 @@ def acquire(
         # Either the token or the lever is already held. The transaction rolled
         # back, so neither row was written.
         return False
+
+    # Announced here, not in each lever, because every lever passes through
+    # acquire: one emitter covers all ten, including the ones mysqld never
+    # logs. "acquire" means the lever is about to be applied -- the SET comes
+    # next and can still fail, in which case "release" follows at once.
+    events.emit(
+        "pxc_lever",
+        {
+            "phase": "acquire",
+            "lever": lever,
+            "node": node,
+            "intent": intent,
+            "restore": restore,
+            "hold_seconds": hold_seconds,
+            "disruptive": lever in DISRUPTIVE,
+            "inv_id": jr.inv_id,
+            "by": getattr(jr, "kind", None),
+        },
+    )
     return True
 
 
@@ -240,7 +275,19 @@ def release(jr, lever: str, node: str, restore: str) -> None:
     Restoring the value is still unconditional and harmless: putting back a
     default we no longer own is at worst a no-op.
     """
-    _apply_restore(lever, node, restore)
+    restored = _apply_restore(lever, node, restore)
+    events.emit(
+        "pxc_lever",
+        {
+            "phase": "release",
+            "lever": lever,
+            "node": node,
+            "restore": restore,
+            "restored": restored,
+            "inv_id": jr.inv_id,
+            "by": getattr(jr, "kind", None),
+        },
+    )
     with jr.conn:
         jr.conn.execute(
             "DELETE FROM lease WHERE lever = ? AND inv_id = ?", (lever, jr.inv_id)

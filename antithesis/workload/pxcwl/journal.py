@@ -138,6 +138,10 @@ class Journal:
     """Handle on the SQLite journal. One per command invocation."""
 
     def __init__(self, kind: str) -> None:
+        # The command role ("first", "traffic", "probe", "verify", ...). The
+        # action events carry it, so a lease taken by setup (seed takes
+        # strict_mode_window to create wl_nopk) is not read as a swarm lever.
+        self.kind = kind
         os.makedirs(config.JOURNAL_DIR, exist_ok=True)
         self.conn = sqlite3.connect(config.JOURNAL_PATH, timeout=30.0)  # noqa: E501
         self.conn.row_factory = sqlite3.Row

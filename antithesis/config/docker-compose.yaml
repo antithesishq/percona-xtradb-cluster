@@ -180,6 +180,10 @@ services:
       PXC_NODE2_HOST: 10.20.20.12
       PXC_NODE3_HOST: 10.20.20.13
       PXC_CLUSTER_SIZE: "3"
+      # Workload levers (SQL admin actions, see workload/README.md). "off"
+      # makes every timeline traffic-only. Launch parameters cannot reach
+      # this; make a levers-off copy with antithesis/config-variant.sh.
+      PXC_LEVERS: "on"
     networks:
       pxc-net:
         ipv4_address: 10.20.20.20

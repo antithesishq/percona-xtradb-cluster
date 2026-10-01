@@ -548,6 +548,12 @@ def run_one(jr, s, profile: dict) -> None:
     """Pull one lever, chosen by the timeline's lever weights."""
     from . import rnd as _rnd
 
+    # Second fence for the lever switch. swarm.draw already zeroes the
+    # weights, but a profile drawn before the switch changed (a journal from an
+    # earlier local run, say) would still carry non-zero ones.
+    if not config.LEVERS_ENABLED:
+        return
+
     weights = dict(profile.get("lever_weight", {}))
     name = _rnd.weighted_choice({k: float(v) for k, v in weights.items()})
     if name is None:

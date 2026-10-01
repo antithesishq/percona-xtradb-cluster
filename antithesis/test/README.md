@@ -28,7 +28,7 @@ fault injection's job is to force the interesting states.
 | Command | Role |
 | --- | --- |
 | `first_seed_workload_schema` | Draws the timeline's swarm profile **once**, creates the schema, applies server posture |
-| `parallel_driver_traffic` | The traffic generator: 7 action classes plus 10 admin levers |
+| `parallel_driver_traffic` | The traffic generator: 7 action classes plus 10 admin levers (see `../workload/README.md`) |
 | `anytime_cluster_probe` | Continuous checks of what each node *claims* against what it *does* |
 | `eventually_verify_convergence` | Terminal oracle, faults stopped, drivers killed mid-flight |
 | `finally_verify_convergence` | Terminal oracle on timelines where every command completed cleanly |

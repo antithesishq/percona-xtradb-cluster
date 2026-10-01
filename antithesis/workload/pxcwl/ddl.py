@@ -25,7 +25,7 @@ import fcntl
 import os
 import time
 
-from . import config, db, oracles, rnd, schema
+from . import config, db, events, oracles, rnd, schema
 
 SCHEMA = config.SCHEMA
 
@@ -341,6 +341,11 @@ def _scratch_lock():
 
 def run_one(jr, s, profile: dict) -> None:
     op = rnd.choice(DDL_OPS)
+    # Same contract as ops.run_one. Emitted before the scratch lock, so a
+    # "lock_busy" skip still shows as an attempt in the log.
+    events.emit(
+        "pxc_op", {"class": "ddl", "op": op.__name__, "node": s.name, "inv_id": getattr(jr, "inv_id", None)}
+    )
     try:
         if op not in SERIALIZED:
             op(jr, s, profile)

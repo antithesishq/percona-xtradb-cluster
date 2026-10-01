@@ -23,6 +23,12 @@ would have to know about.
 **snouty launch**
 Use `snouty launch --json --webhook basic_test --config antithesis/config` to start an Antithesis run. Always run `compose build` first to ensure images are up to date.
 
+**config-variant.sh**
+Makes a copy of `config/` with workload switches changed, for one launch:
+`./antithesis/config-variant.sh no-levers PXC_LEVERS=off` writes
+`antithesis/config-no-levers/`. Launch parameters cannot reach a container, so
+this is how a workload switch gets into a run. See `workload/README.md`.
+
 **snouty validate**
 Use this command to quickly validate changes to the Antithesis scaffolding. See `snouty validate --help` for details.
 
@@ -67,11 +73,16 @@ moved, rather than silently no-op'ing.
 **pxc-node/**
 `my.cnf` — shared server config. `entrypoint.sh` — the supervisor: bootstrap
 guard, `--wsrep-recover` dance, restart loop, the workload→supervisor kill
-channel, hold-down knob, and JSONL boot/restart accounting. `notify.sh` — a
+channel (served, but unused in v1: the workload container cannot reach
+`/opt/antithesis/state`), hold-down knob, and JSONL boot/restart accounting. `notify.sh` — a
 `wsrep_notify_cmd` script baked in but not wired up; enabling it needs a config
 variant because the variable is READ_ONLY.
 
 **workload/**
+Start with `workload/README.md`. It explains the test commands, the swarm
+profile, and the **levers**: the SQL administrator actions that the workload
+does to the nodes. Levers run in every run, also when the launch turns off
+Antithesis faults, so read it before you triage a crash.
 `entrypoint.py` — readiness gate, schema seeding, the bootstrap property, and
 `setup_complete`. `/opt/antithesis/catalog/` symlinks here for assertion
 cataloging, so **assertion names must be inline constant string literals**.

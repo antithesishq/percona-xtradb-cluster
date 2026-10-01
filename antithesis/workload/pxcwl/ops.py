@@ -15,7 +15,7 @@ interesting.
 from __future__ import annotations
 
 
-from . import config, db, journal, oracles, rnd, schema
+from . import config, db, events, journal, oracles, rnd, schema
 
 SCHEMA = config.SCHEMA
 
@@ -643,6 +643,12 @@ def run_one(jr, s: Session, profile: dict, cls: str) -> None:
     if not choices:
         return
     op = rnd.choice(choices)
+    # Announced before the SQL, so an operation that is in flight when a node
+    # dies is in the crash log. No write id: each op mints its own inside, and
+    # inv_id plus the op name is enough to find its journal rows.
+    events.emit(
+        "pxc_op", {"class": cls, "op": op.__name__, "node": s.name, "inv_id": getattr(jr, "inv_id", None)}
+    )
     try:
         op(jr, s, profile)
     except Exception as e:  # noqa: BLE001 - an op must never take the driver down

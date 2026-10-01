@@ -29,6 +29,16 @@ def sometimes(condition, message, details): _rec("sometimes", condition, message
 def reachable(message, details): _rec("reachable", True, message, details)
 def unreachable(message, details): _rec("unreachable", False, message, details)
 ''',
+    # pxcwl/events.py sends structured action events through send_event.
+    # Recorded rather than dropped, so a test can also check what the
+    # workload announced.
+    "antithesis/lifecycle.py": '''
+EVENTS = []
+
+
+def send_event(event_name, details): EVENTS.append({event_name: dict(details)})
+def setup_complete(details=None): EVENTS.append({"setup_complete": details})
+''',
     "antithesis/random.py": '''
 import random as _r
 

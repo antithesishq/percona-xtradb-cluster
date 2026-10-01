@@ -32,6 +32,23 @@ JOURNAL_DIR = os.environ.get("PXC_JOURNAL_DIR", "/opt/antithesis/journal")
 JOURNAL_PATH = os.path.join(JOURNAL_DIR, "pxc.sqlite3")
 
 # --------------------------------------------------------------------------
+# Lever switch. "off" makes every timeline traffic-only: swarm.draw zeroes
+# the admin class and every lever weight, and levers.run_one refuses to run.
+#
+# Why an environment variable and not a launch parameter: launch parameters
+# (custom.*) configure the Antithesis platform and never reach a container.
+# The compose file sets this explicitly; antithesis/config-variant.sh makes a
+# copy of the config directory with it turned off. See workload/README.md.
+# --------------------------------------------------------------------------
+
+LEVERS_ENABLED = os.environ.get("PXC_LEVERS", "on").strip().lower() not in (
+    "off",
+    "0",
+    "false",
+    "no",
+)
+
+# --------------------------------------------------------------------------
 # Per-invocation budgets. A test command must eventually exit; each driver
 # invocation is one bounded chunk of work and Antithesis re-runs it for more.
 # --------------------------------------------------------------------------

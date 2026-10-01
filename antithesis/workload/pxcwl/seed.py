@@ -20,7 +20,7 @@ from __future__ import annotations
 import traceback
 import time
 
-from . import config, db, journal, leases, schema, swarm
+from . import config, db, events, journal, leases, schema, swarm
 
 
 class SeedSchemaError(RuntimeError):
@@ -152,6 +152,48 @@ def run() -> int:
         return 0
 
 
+def _log_profile(profile: dict[str, object]) -> None:
+    """Publish the timeline's swarm profile to the Antithesis log.
+
+    Without this, triage cannot tell what a timeline was doing when it failed:
+    whether it pulled levers at all, which classes it ran, how hard it pushed.
+    It is emitted as a structured SDK event rather than a print, so
+    `snouty runs events <run> pxc_swarm_profile` finds it in any history, and
+    it sits in the same log stream as the assertions it explains.
+
+    The derived fields answer the first triage question directly. A lever can
+    only run when BOTH the admin class and that lever have a non-zero weight
+    (traffic.py routes "admin" to levers.run_one, which draws by lever_weight),
+    so `levers_enabled` is empty exactly on the traffic-only timelines.
+
+    `levers_switch` records the PXC_LEVERS environment switch, so a
+    traffic-only timeline in a levers-off run can be told apart from one that
+    drew zero lever weights by chance.
+
+    Logging must never break seeding: the profile is already published, and a
+    failure here would only cost the record, not the timeline.
+    """
+    try:
+        class_weight = dict(profile.get("class_weight", {}))
+        lever_weight = dict(profile.get("lever_weight", {}))
+        admin_on = float(class_weight.get("admin", 0)) > 0
+        levers_enabled = sorted(
+            name for name, w in lever_weight.items() if admin_on and float(w) > 0
+        )
+        events.emit(
+            "pxc_swarm_profile",
+            {
+                "levers_switch": "on" if config.LEVERS_ENABLED else "off",
+                "levers_enabled": levers_enabled,
+                "traffic_only": not levers_enabled,
+                "classes_enabled": sorted(c for c, w in class_weight.items() if float(w) > 0),
+                "profile": profile,
+            },
+        )
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
+
+
 def _run() -> int:
     jr = journal.Journal("first")
     try:
@@ -185,6 +227,7 @@ def _run() -> int:
             db.close_quietly(conn)
 
         jr.put_swarm(profile)
+        _log_profile(profile)
         jr.put_observed("fc_limit", profile["fc_limit"])
         jr.put_observed("nopk_table", nopk)
         jr.put_observed("timeline_started_at", time.time())

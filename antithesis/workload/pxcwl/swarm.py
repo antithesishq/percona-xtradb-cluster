@@ -57,6 +57,14 @@ def draw() -> dict[str, object]:
 
     lever_weights = {l: float(rnd.choice(LEVER_WEIGHT_BAG)) for l in LEVERS}
 
+    # With the lever switch off, zero the weights AFTER drawing them rather
+    # than skipping the draws. Every draw is a decision Antithesis tracks, so
+    # skipping them would shift every later choice and make a levers-off
+    # timeline differ from its levers-on twin in more than the levers.
+    if not config.LEVERS_ENABLED:
+        weights["admin"] = 0.0
+        lever_weights = {l: 0.0 for l in LEVERS}
+
     return {
         "class_weight": weights,
         "lever_weight": lever_weights,
