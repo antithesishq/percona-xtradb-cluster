@@ -29,7 +29,7 @@ controlled by launch parameters.
 
 | Source | Who controls it | On in this harness? |
 | --- | --- | --- |
-| Antithesis faults: network partitions, node pause, node kill, clock skips | The launch parameters, for example `custom.disable_faults` on the `intermediate_test` webhook | Yes, unless the launch turns them off |
+| Antithesis faults: network partitions, node pause, node kill, clock skips | The launch parameters, for example `custom.disable_faults` on the `percona` webhook | Yes, unless the launch turns them off |
 | Workload levers: SQL administrator actions, described below | The swarm profile of each timeline (`pxcwl/swarm.py`), and the `PXC_LEVERS` switch | Yes, unless the config sets `PXC_LEVERS: "off"`. No launch parameter turns them off |
 | Supervisor kill channel: `kill -9` of `mysqld` through a file in `/opt/antithesis/state` | `../pxc-node/entrypoint.sh` | No. The supervisor serves it, but the workload container cannot write to that directory, so nothing uses it in v1 |
 

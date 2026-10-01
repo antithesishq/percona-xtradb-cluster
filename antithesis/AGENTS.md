@@ -21,7 +21,25 @@ failure. New pre-launch checks go INTO this script (a step in
 would have to know about.
 
 **snouty launch**
-Use `snouty launch --json --webhook basic_test --config antithesis/config` to start an Antithesis run. Always run `compose build` first to ensure images are up to date.
+Use the `percona` webhook for pxc runs. Always run `compose build` first to ensure images are up to date. The default launch is:
+
+```sh
+snouty launch --json --webhook percona --config antithesis/config \
+  --test-name "<name>" --description "<what this run tests>" --duration <minutes> \
+  --param custom.include_for_node_termination="pxc-node[123]" \
+  --param custom.include_for_node_hang="pxc-node[123]" \
+  --param custom.include_for_node_throttle="pxc-node[123]" \
+  --param custom.vm_memory_gb=16
+```
+
+Network faults hit every container, including `pxc-workload`. Kill, hang and
+throttle hit `pxc-node1..3` only, because killing the workload tests the
+harness, not PXC. `custom.cpu_modulation` cannot be scoped and also throttles
+the workload, so it stays off unless a run asks for it. The other `custom.*`
+params (`disable_faults`, `disable_network_faults`, `clock_jitter`,
+`smoke_test_seconds`, the `include_all_*` bools) keep the webhook defaults.
+`custom.vm_memory_gb` sets the VM memory in GB. The webhook default is 10;
+pxc runs pass 16.
 
 **config-variant.sh**
 Makes a copy of `config/` with workload switches changed, for one launch:
