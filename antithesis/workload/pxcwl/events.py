@@ -11,10 +11,13 @@ nothing.
 So every action is announced when it STARTS, as an SDK event. That is the one
 placement that puts the in-flight action -- the likeliest trigger -- before the
 crash in the log, in order, with its virtual time. A summary at the end of a
-driver call would miss exactly that action. Find the events with:
+driver call would miss exactly that action. Each event is a top-level key of
+its line in a downloaded history log:
 
-    snouty runs events <run_id> pxc_lever
-    snouty runs events <run_id> pxc_op
+    snouty runs --json logs <run_id> <input_hash> <vtime> > history.ndjson
+    jq 'select(.pxc_swarm_profile or .pxc_lever or .pxc_op)' history.ndjson
+
+`snouty runs events` does not search custom SDK events, so it cannot find them.
 
 Event names are inline constants at each call site, not built here, so a grep
 for the name finds every emitter.

@@ -146,8 +146,8 @@ So about 29% of timelines in every run have traffic and no levers. Those
 timelines are a baseline without levers.
 
 The `first_` command logs the profile as the SDK event `pxc_swarm_profile`
-(`seed._log_profile`). Find it with
-`snouty runs events <run_id> pxc_swarm_profile`. The event has these fields:
+(`seed._log_profile`). It is in every downloaded history log (see "Action
+events in the log" for how to select it). The event has these fields:
 
 - `levers_switch`: The `PXC_LEVERS` value, `on` or `off`.
 - `levers_enabled`: The levers that this timeline can pull. A lever needs a
@@ -207,9 +207,12 @@ Notes:
   follows at once.
 - `restored: false` means the restore SQL could not reach the node. The
   lease stays, and a later command retries the restore.
-- Find the events with `snouty runs events <run_id> pxc_lever` or
-  `... pxc_op`. In a downloaded log, select them with
-  `jq 'select(.pxc_lever or .pxc_op)'`.
+- `snouty runs events` does NOT find these events: it searches log text,
+  assertion messages and command text, not custom SDK events (checked on run
+  `bf4c09360d079b47b8800ca262830efa-63-2`). Download a history with
+  `snouty runs --json logs` and select them with
+  `jq 'select(.pxc_swarm_profile or .pxc_lever or .pxc_op)'`. Each event is a
+  top-level key of its log line.
 - `pxc_op` adds volume, one event per operation. Check the "Customer output
   volume" property after a run. If it goes above 200 MB per core-hour, keep
   `pxc_op` only for the `conflict`, `sr` and `ddl` classes.
