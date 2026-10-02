@@ -468,6 +468,10 @@ def bulk_write(jr, s: Session, profile: dict) -> None:
     Capped at half the 16M gcache: a writeset larger than the gcache forces a
     full SST on every subsequent rejoin, which would distort every state
     transfer property in the run.
+
+    Deliberately NOT rate-limited for disk: the sustained large-writeset flood
+    is coverage (flow control, receive queue, gcache paging). The disk is kept
+    in budget by binlog rotation and expiry instead (config.BINLOG_*).
     """
     size = min(int(profile.get("bulk_bytes", 65536)), config.BULK_MAX_BYTES)
     bid = rnd.randint(0, config.BULK_RING_SIZE - 1)

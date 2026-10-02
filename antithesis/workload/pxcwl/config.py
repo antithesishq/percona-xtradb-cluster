@@ -96,6 +96,32 @@ GCACHE_BYTES = 16 * 1024 * 1024
 BULK_MAX_BYTES = GCACHE_BYTES // 2
 
 # --------------------------------------------------------------------------
+# Disk budget.
+#
+# Antithesis gives the VM's disk half of `custom.vm_memory_gb` (8 GB on the
+# 16 GB VM pxc runs use), all containers share it, and memory draws on the
+# same pool. Run a03e2f17272bb3ed7aa59e50a0f30d50-63-2 filled it by vtime ~134
+# with no faults: about 8 bulk writes/s of 2 MB, each probably written twice
+# into every node's ROW binlog (before and after image of the REPLACE; not
+# measured yet, see the pxc_disk event), with nothing ever purged.
+# Running out of disk is worth testing, but as a deliberate fault, not as an
+# accident that buries every other finding.
+#
+# Binlog: rotate at 64M and expire after 10 s. MySQL purges only when a file
+# rotates, so each node keeps about 10 s plus one file's worth of binlog: about
+# 400 MB per node at the bulk flood rate (estimated ~32 MB/s of binlog), where
+# 60 s would keep ~2 GB per node and fill the shared disk with the datadirs and
+# memory. Nothing in the harness reads old binlogs (IST uses gcache, SST uses
+# xtrabackup), and the active file that crash recovery needs is never purged.
+# Mirrored in my.cnf; seed._apply_posture applies them too.
+BINLOG_MAX_BYTES = 64 * 1024 * 1024
+BINLOG_EXPIRE_SECONDS = 10
+# gcache overflow pages. Every writeset that does not fit the 16M ring spills
+# into a page preallocated at this size (default 128M). 32M still holds the
+# largest bulk writeset (BULK_MAX_BYTES), and a larger one gets its own page.
+GCACHE_PAGE_BYTES = 32 * 1024 * 1024
+
+# --------------------------------------------------------------------------
 # Table registry.
 #
 # CHECKSUM_TABLES are compared across nodes by the terminal oracle. Membership

@@ -15,7 +15,7 @@ driver call would miss exactly that action. Each event is a top-level key of
 its line in a downloaded history log:
 
     snouty runs --json logs <run_id> <input_hash> <vtime> > history.ndjson
-    jq 'select(.pxc_swarm_profile or .pxc_lever or .pxc_op)' history.ndjson
+    jq 'select(.pxc_swarm_profile or .pxc_lever or .pxc_op or .pxc_disk)' history.ndjson
 
 `snouty runs events` does not search custom SDK events, so it cannot find them.
 

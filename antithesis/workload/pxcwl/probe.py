@@ -14,10 +14,11 @@ reaching the end of the window.
 
 from __future__ import annotations
 
+import os
 import traceback
 import time
 
-from . import config, db, journal, leases, oracles
+from . import config, db, events, journal, leases, oracles
 
 
 def _progress_row(jr, node: str) -> dict:
@@ -205,10 +206,53 @@ def run() -> int:
         return 0
 
 
+def _disk_sample() -> None:
+    """Log one sample of disk use as the SDK event `pxc_disk`.
+
+    Why: the VM's disk is half of `custom.vm_memory_gb`, shared by every
+    container, and run a03e2f17272bb3ed7aa59e50a0f30d50-63-2 filled it with no
+    sign in the log until mysqld reported errno 28. This shows how close a
+    history came, and it is the baseline for a deliberate disk-fill fault.
+
+    - `binlog_bytes`: each node's binlog total from SHOW BINARY LOGS, the
+      writer that filled the disk. None when the node is unreachable.
+    - `workload_fs`: statvfs of this container's root. Whether that is the
+      same pool the nodes write to is not confirmed.
+
+    Data only, no assertion: what counts as "too full" is for the planned
+    disk-fill fault to define.
+    TODO: sample the nodes' own filesystems (needs the supervisor, so a
+    pxc-node rebuild).
+    """
+    binlog_bytes: dict[str, int | None] = {}
+    for name, host in config.NODES:
+        conn = db.connect_with_retry(host, attempts=1)
+        if conn is None:
+            binlog_bytes[name] = None
+            continue
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SHOW BINARY LOGS")
+                binlog_bytes[name] = sum(int(row[1]) for row in cur.fetchall())
+        except Exception:  # noqa: BLE001 - a sample is best-effort
+            binlog_bytes[name] = None
+        finally:
+            db.close_quietly(conn)
+    st = os.statvfs("/")
+    events.emit(
+        "pxc_disk",
+        {
+            "binlog_bytes": binlog_bytes,
+            "workload_fs": {"total": st.f_blocks * st.f_frsize, "free": st.f_bavail * st.f_frsize},
+        },
+    )
+
+
 def _run() -> int:
     jr = journal.Journal("probe")
     try:
         leases.repair_expired(jr)
+        _disk_sample()
         deadline = time.time() + config.PROBE_WALL_BUDGET_SECONDS
         saw_small_cluster = False
         # Reach claims already made this invocation, as "node:pattern".

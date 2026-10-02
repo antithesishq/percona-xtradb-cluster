@@ -63,10 +63,26 @@ def _apply_posture(profile: dict) -> dict[str, object]:
                 cur.execute(
                     "SET GLOBAL wsrep_provider_options = %s", (f"gcs.fc_limit={fc_limit}",)
                 )
-                # Container-local disk with no volumes, sync_binlog=1 and
-                # log_replica_updates=ON: binlogs would otherwise grow for the
-                # whole run and could fill the filesystem.
-                cur.execute("SET GLOBAL binlog_expire_logs_seconds = 600")
+                # Disk budget. All containers share half the VM size as disk
+                # (8 GB on a 16 GB VM), and in run
+                # a03e2f17272bb3ed7aa59e50a0f30d50-63-2 binlogs plus gcache
+                # pages filled it by vtime ~134 in every bulk-heavy timeline.
+                # my.cnf sets the same values; they are repeated here so that
+                # a pxc-node image built before that my.cnf change still gets
+                # them. MySQL purges expired binlogs only when a file rotates,
+                # so the expiry needs the small max_binlog_size to act at all.
+                # PERSIST, not GLOBAL, so the values survive a node restart.
+                cur.execute("SET PERSIST max_binlog_size = %s", (config.BINLOG_MAX_BYTES,))
+                cur.execute(
+                    "SET PERSIST binlog_expire_logs_seconds = %s", (config.BINLOG_EXPIRE_SECONDS,)
+                )
+                # GLOBAL only: persisting wsrep_provider_options would replace
+                # my.cnf's whole option string (gcache.size=16M) at the next
+                # start. A restarted node falls back to the image's my.cnf.
+                cur.execute(
+                    "SET GLOBAL wsrep_provider_options = %s",
+                    (f"gcache.page_size={config.GCACHE_PAGE_BYTES}",),
+                )
             applied[name] = "ok"
         except Exception as exc:  # noqa: BLE001 - posture is best-effort
             applied[name] = f"partial: {str(exc)[:120]}"

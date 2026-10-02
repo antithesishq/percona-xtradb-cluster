@@ -192,6 +192,7 @@ call would arrive after the crash, and a crash log ends at the crash.
 | `pxc_swarm_profile` | `seed._log_profile` | One time per timeline | See above |
 | `pxc_lever` | `leases.acquire`, `leases.release`, `leases.repair_expired` | `phase: acquire` just before the lever's SQL. `phase: release` when the lever ends. `phase: repair` when another command restores a lever whose holder was killed | `lever`, `node`, `intent`, `restore`, `hold_seconds`, `disruptive`, `restored`, `inv_id`, `by` |
 | `pxc_op` | `ops.run_one`, `ddl.run_one` | Just before each traffic or DDL operation | `class`, `op`, `node`, `inv_id` |
+| `pxc_disk` | `probe._disk_sample` | At the start of each `anytime_` probe call | `binlog_bytes` (per node, from `SHOW BINARY LOGS`), `workload_fs` (`total`, `free` of the workload container's root; not confirmed to be the nodes' disk) |
 
 `inv_id` is the driver call's id in the journal. It links an event to the
 journal rows of that call.
@@ -211,7 +212,7 @@ Notes:
   assertion messages and command text, not custom SDK events (checked on run
   `bf4c09360d079b47b8800ca262830efa-63-2`). Download a history with
   `snouty runs --json logs` and select them with
-  `jq 'select(.pxc_swarm_profile or .pxc_lever or .pxc_op)'`. Each event is a
+  `jq 'select(.pxc_swarm_profile or .pxc_lever or .pxc_op or .pxc_disk)'`. Each event is a
   top-level key of its log line.
 - `pxc_op` adds volume, one event per operation. Check the "Customer output
   volume" property after a run. If it goes above 200 MB per core-hour, keep
