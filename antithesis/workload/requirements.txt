@@ -1,6 +1,9 @@
 # Antithesis Python SDK — assertions, lifecycle (setup_complete), randomness.
 # Pinned so the assertion catalog is reproducible across rebuilds.
-antithesis==0.3.1
+# At least 0.3.99: older SDKs cannot read the coverage symbol table that the
+# Antithesis Python instrumentor writes (build error 4011), so Python coverage
+# is lost.
+antithesis==0.4.0
 
 # Pure-Python MySQL driver. Chosen over mysqlclient deliberately: it needs no
 # libmysqlclient headers or C toolchain in the runtime image, which keeps the

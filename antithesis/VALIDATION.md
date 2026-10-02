@@ -28,7 +28,7 @@ Everything that could be checked without a runtime was:
 | **`pxc-node/entrypoint.sh` run end to end against a fake `mysqld`** | ✅ see below |
 | `pxc-node/notify.sh` including the `notify-delay` and `notify-fail` knobs | ✅ valid JSONL, multi-line member list flattened, knobs honored |
 | `workload/entrypoint.py` imports with the real `antithesis` + `PyMySQL` installed | ✅ clean |
-| Antithesis Python SDK signatures match the calls | ✅ `reachable(message, details)` and `setup_complete(details)` verified against installed `antithesis==0.3.1`; both calls execute without error |
+| Antithesis Python SDK signatures match the calls | ✅ `reachable(message, details)` and `setup_complete(details)` verified against installed `antithesis==0.4.0`; both calls execute without error |
 | cmake options passed actually exist in this tree | ✅ checked against `CMakeLists.txt` / `cmake/*.cmake`; `WITH_MYSQLX`, `DOWNLOAD_BOOST` and `WITH_BOOST` were removed after confirming this tree does not use them |
 | PXB 8.4.0-5 tarball URL resolves | ✅ HTTP 200 |
 | Antithesis C++ SDK header URLs at `v0.5.0` resolve | ✅ HTTP 200 |
