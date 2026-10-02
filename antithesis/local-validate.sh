@@ -31,9 +31,9 @@
 #   --offline    run only the offline checks (phase 1). Use this on a machine
 #                with no container runtime; it still needs bash, python3, awk
 #                and jq
-#   --build      rebuild images first (the pxc-node stage compiles PXC and
-#                galera from source and is very slow; omit to reuse what you
-#                already have)
+#   --build      rebuild images first, with antithesis/build-images.sh: it
+#                reuses the stored pxc-base image from the registry, and
+#                compiles PXC only when the PXC inputs changed
 #   --keep       skip the initial `down -v` and reuse the running cluster
 #   --rounds N   driver/probe rounds to run (default 3)
 #   --out FILE   log path (default ./local-validate-<utc stamp>.log)
@@ -385,8 +385,8 @@ else
 fi
 
 if [[ $DO_BUILD -eq 1 ]]; then
-    note "building; the pxc-node stage compiles PXC + galera from source"
-    if ! step "compose:build" "${COMPOSE[@]}" build; then
+    note "building with build-images.sh; it compiles PXC only if no stored pxc-base matches"
+    if ! step "compose:build" "${HERE}/build-images.sh"; then
         section "ABORT: build failed"
         return 1
     fi

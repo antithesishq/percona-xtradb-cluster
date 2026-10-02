@@ -5,11 +5,18 @@
 # Build context is the repo root (percona-xtradb-cluster/). Stages:
 #
 #   pxc-build   build mysqld (cmake) + libgalera_smm.so/garbd (scons) from source
-#   pxc-node    runtime image for pxc-node1/2/3 — mysqld under a supervisor
+#   pxc-base    runtime OS + the compiled install tree; stored in the registry
+#               by antithesis/build-images.sh, keyed by a hash of its inputs
+#   assert-tiers  build-time table of debug-only InnoDB assertion sites
+#   pxc-node    pxc-base + the harness: mysqld under a supervisor
 #   workload    Python test driver, Antithesis Python SDK, bootstrap assertion
 #
 # See antithesis/scratchbook/instrumentation-inventory.md for the instrumentation
 # decision record and antithesis/VALIDATION.md for how to build and validate.
+
+# The image pxc-node builds on. A global ARG, because FROM can only read ARGs
+# declared before the first FROM. See the pxc-base and pxc-node stages.
+ARG PXC_BASE_IMAGE=pxc-base
 
 # ---------------------------------------------------------------------------
 # Stage: pxc-src — the PXC source tree with the harness directory removed.
@@ -559,33 +566,21 @@ RUN set -eux; \
     install_pxb 8.0 "${PXB80_VERSION}"
 
 # ---------------------------------------------------------------------------
-# Stage: assert-tiers — which InnoDB assertion sites are debug-only.
+# Stage: pxc-base — the runtime OS plus the compiled PXC install tree.
 #
-# The supervisor labels every mysqld death by whether a release build would
-# die the same way (pxc-node/entrypoint.sh, assert_tier). For InnoDB's
-# "Assertion failure: FILE:LINE" that needs the source, which the runtime
-# image does not carry, so the verdict table is computed here once.
+# Everything heavy and slow lives here; nothing from the harness does. That
+# split is what lets antithesis/build-images.sh keep this image in the
+# Antithesis registry, tagged by a hash of its inputs, instead of in this VM's
+# build cache: the cache did not survive a full disk or a purge, and each loss
+# cost a 75-100 minute compile. A harness change now rebuilds only pxc-node
+# below, on top of the stored base.
 #
-# A separate stage FROM pxc-build, and after its compile, so editing the
-# scanner re-runs only this stage, never the compile.
+# The hash covers everything above the END marker that closes this stage, plus
+# the PXC source tree, the submodules and antithesis/build/. Anything that
+# changes the binaries must therefore stay ABOVE that marker, and anything
+# below it must not change them.
 # ---------------------------------------------------------------------------
-FROM pxc-build AS assert-tiers
-
-COPY antithesis/pxc-node/assert_tiers.py /opt/antithesis/build-tools/assert_tiers.py
-# Spot checks against verified sites, so a scanner regression fails the build
-# instead of silently mislabeling deaths: lock0lock.cc:5282 is a ut_a inside
-# `#ifdef UNIV_DEBUG` (rec_queue_validate_latched), lock0lock.cc:336 a plain
-# ut_a that release builds keep.
-RUN set -eux; \
-    python3 /opt/antithesis/build-tools/assert_tiers.py /src > /assert-tiers.tsv; \
-    grep -qP '^lock0lock\.cc:5282\tdebug_only\t' /assert-tiers.tsv; \
-    grep -qP '^lock0lock\.cc:336\trelease\t' /assert-tiers.tsv; \
-    wc -l /assert-tiers.tsv
-
-# ---------------------------------------------------------------------------
-# Stage: pxc-node — runtime image for pxc-node1/2/3
-# ---------------------------------------------------------------------------
-FROM debian:bookworm-slim AS pxc-node
+FROM debian:bookworm-slim AS pxc-base
 
 ARG PXC_PREFIX=/usr/local/pxc
 
@@ -671,6 +666,50 @@ RUN set -eux; \
     mkdir -p /var/lib/mysql /var/log/mysql /var/run/mysqld \
              /opt/antithesis/pxc /opt/antithesis/state; \
     chown -R mysql:mysql /var/lib/mysql /var/log/mysql /var/run/mysqld /opt/antithesis/state
+
+# === END OF PXC-BASE INPUTS ===
+# antithesis/build-images.sh hashes this file from the top down to the line
+# above. Keep it exactly as written.
+
+# ---------------------------------------------------------------------------
+# Stage: assert-tiers — which InnoDB assertion sites are debug-only.
+#
+# The supervisor labels every mysqld death by whether a release build would
+# die the same way (pxc-node/entrypoint.sh, assert_tier). For InnoDB's
+# "Assertion failure: FILE:LINE" that needs the source, which the runtime
+# image does not carry, so the verdict table is computed here once.
+#
+# Deliberately NOT built from pxc-build: that would pull the whole compile
+# back into every pxc-node build. The scanner reads only the InnoDB source
+# straight from the build context. That is the same text the compile sees,
+# because antithesis/build/patch-sources.sh patches nothing under storage/;
+# the spot checks below fail the build if line numbers ever drift.
+# ---------------------------------------------------------------------------
+FROM debian:bookworm-slim AS assert-tiers
+
+RUN apt-get update && apt-get install -y --no-install-recommends python3-minimal \
+    && rm -rf /var/lib/apt/lists/*
+COPY storage/innobase /src/storage/innobase
+COPY plugin/innodb_memcached /src/plugin/innodb_memcached
+COPY antithesis/pxc-node/assert_tiers.py /opt/antithesis/build-tools/assert_tiers.py
+# Spot checks against verified sites, so a scanner regression fails the build
+# instead of silently mislabeling deaths: lock0lock.cc:5282 is a ut_a inside
+# `#ifdef UNIV_DEBUG` (rec_queue_validate_latched), lock0lock.cc:336 a plain
+# ut_a that release builds keep.
+RUN set -eux; \
+    python3 /opt/antithesis/build-tools/assert_tiers.py /src > /assert-tiers.tsv; \
+    grep -qP '^lock0lock\.cc:5282\tdebug_only\t' /assert-tiers.tsv; \
+    grep -qP '^lock0lock\.cc:336\trelease\t' /assert-tiers.tsv; \
+    wc -l /assert-tiers.tsv
+
+# ---------------------------------------------------------------------------
+# Stage: pxc-node — runtime image for pxc-node1/2/3: the base plus the harness.
+#
+# PXC_BASE_IMAGE is the stage above by default, so a plain
+# `docker compose build` still works and compiles locally. build-images.sh
+# passes the stored registry image instead.
+# ---------------------------------------------------------------------------
+FROM ${PXC_BASE_IMAGE} AS pxc-node
 
 COPY antithesis/pxc-node/my.cnf /etc/my.cnf
 COPY antithesis/pxc-node/entrypoint.sh /opt/antithesis/pxc/entrypoint.sh

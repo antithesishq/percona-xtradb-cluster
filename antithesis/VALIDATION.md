@@ -95,8 +95,11 @@ podman compose version   # must print "Docker Compose version ..."
 From the repo root (`percona-xtradb-cluster/`):
 
 ```sh
-docker compose -f antithesis/config/docker-compose.yaml build
+./antithesis/build-images.sh
 ```
+
+It reuses the stored `pxc-base` image when the PXC inputs are unchanged. See
+the header of `build-images.sh`.
 
 **Expect this to take a long time.** It builds PXC 8.4 from source: galera via
 scons, then the full server via cmake. Budget an hour or more on a cold cache

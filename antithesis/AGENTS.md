@@ -21,7 +21,7 @@ failure. New pre-launch checks go INTO this script (a step in
 would have to know about.
 
 **snouty launch**
-Use the `percona` webhook for pxc runs. Always run `compose build` first to ensure images are up to date. The default launch is:
+Use the `percona` webhook for pxc runs. Before a launch, check whether the images are current. Rebuild stale ones with `./antithesis/build-images.sh [service...]`. The default launch is:
 
 ```sh
 snouty launch --json --webhook percona --config antithesis/config \
@@ -73,9 +73,15 @@ decision record.
 
 **Dockerfile**
 Multi-stage, built from the repo root. Stages: `pxc-build` (compiles PXC from
-source — galera via scons, server via cmake), `pxc-node` (runtime for
-pxc-node1/2/3), `workload` (Python test driver). Build with
-`<engine> compose -f antithesis/config/docker-compose.yaml build`.
+source — galera via scons, server via cmake), `pxc-base` (runtime OS plus the
+compiled install tree), `assert-tiers` (debug-only InnoDB assertion table),
+`pxc-node` (`pxc-base` plus the harness, for pxc-node1/2/3), `workload`
+(Python test driver). Build with `./antithesis/build-images.sh [service...]`.
+It hashes the `pxc-base` inputs and pulls `<repository>/pxc-base:<hash>` from
+the registry when it exists, so only a change to PXC source, the submodules,
+`antithesis/build/` or the Dockerfile above `# === END OF PXC-BASE INPUTS ===`
+compiles. A plain `<engine> compose ... build` still works, but compiles
+locally.
 
 `ARG PXC_INSTRUMENT=0` is the flip point for C/C++ coverage instrumentation,
 which is **deliberately deferred in v1**. Read
