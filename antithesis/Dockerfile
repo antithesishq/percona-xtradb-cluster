@@ -559,6 +559,30 @@ RUN set -eux; \
     install_pxb 8.0 "${PXB80_VERSION}"
 
 # ---------------------------------------------------------------------------
+# Stage: assert-tiers — which InnoDB assertion sites are debug-only.
+#
+# The supervisor labels every mysqld death by whether a release build would
+# die the same way (pxc-node/entrypoint.sh, assert_tier). For InnoDB's
+# "Assertion failure: FILE:LINE" that needs the source, which the runtime
+# image does not carry, so the verdict table is computed here once.
+#
+# A separate stage FROM pxc-build, and after its compile, so editing the
+# scanner re-runs only this stage, never the compile.
+# ---------------------------------------------------------------------------
+FROM pxc-build AS assert-tiers
+
+COPY antithesis/pxc-node/assert_tiers.py /opt/antithesis/build-tools/assert_tiers.py
+# Spot checks against verified sites, so a scanner regression fails the build
+# instead of silently mislabeling deaths: lock0lock.cc:5282 is a ut_a inside
+# `#ifdef UNIV_DEBUG` (rec_queue_validate_latched), lock0lock.cc:336 a plain
+# ut_a that release builds keep.
+RUN set -eux; \
+    python3 /opt/antithesis/build-tools/assert_tiers.py /src > /assert-tiers.tsv; \
+    grep -qP '^lock0lock\.cc:5282\tdebug_only\t' /assert-tiers.tsv; \
+    grep -qP '^lock0lock\.cc:336\trelease\t' /assert-tiers.tsv; \
+    wc -l /assert-tiers.tsv
+
+# ---------------------------------------------------------------------------
 # Stage: pxc-node — runtime image for pxc-node1/2/3
 # ---------------------------------------------------------------------------
 FROM debian:bookworm-slim AS pxc-node
@@ -650,6 +674,7 @@ RUN set -eux; \
 
 COPY antithesis/pxc-node/my.cnf /etc/my.cnf
 COPY antithesis/pxc-node/entrypoint.sh /opt/antithesis/pxc/entrypoint.sh
+COPY --from=assert-tiers /assert-tiers.tsv /opt/antithesis/pxc/assert-tiers.tsv
 COPY antithesis/pxc-node/notify.sh /opt/antithesis/pxc/notify.sh
 COPY antithesis/setup-complete.sh /opt/antithesis/setup-complete.sh
 RUN chmod 0755 /opt/antithesis/pxc/entrypoint.sh \

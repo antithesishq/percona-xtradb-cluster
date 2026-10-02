@@ -37,6 +37,8 @@ DATADIR="${PXC_DATADIR:-/var/lib/mysql}"
 LOG_ERROR="${PXC_LOG_ERROR:-/var/log/mysql/error.log}"
 STATE_DIR="${PXC_STATE_DIR:-/opt/antithesis/state}"
 DEFAULTS_FILE="${PXC_DEFAULTS_FILE:-/etc/my.cnf}"
+# Build-time verdicts on InnoDB assertion sites (pxc-node/assert_tiers.py).
+ASSERT_TIERS_FILE="${PXC_ASSERT_TIERS_FILE:-/opt/antithesis/pxc/assert-tiers.tsv}"
 NODE_CNF_DIR="${PXC_NODE_CNF_DIR:-/etc/my.cnf.d}"
 NODE_CNF="${NODE_CNF_DIR}/node.cnf"
 
@@ -142,9 +144,41 @@ A_DIED_INCONSISTENT_LINE=4
 #     passing mean the same thing, and the platform evaluates an undeclared
 #     assertion the first time it sees it. Keying on file:line is what lets a
 #     report say gcs_node.cpp:224 x41 instead of "mysqld x76".
-A_ASSERT_ANY="mysqld never aborts on a failed assertion"
-A_ASSERT_ANY_LINE=5
+#
+# Both tiers are split by BUILD TIER, because the findings go to the Percona
+# team and every death has to say whether a production build would die the
+# same way. This image is a Debug build (mysqld: CMAKE_BUILD_TYPE=Debug, so
+# UNIV_DEBUG on and NDEBUG off; Galera: debug=3, NDEBUG off), so it checks
+# invariants that release builds compile out:
+#   - debug-only: glibc assert() in mysqld, wsrep-lib or Galera (release
+#     builds define NDEBUG; Galera's SConstruct:92), InnoDB ut_ad, and InnoDB
+#     ut_a inside #ifdef UNIV_DEBUG. The invariant is PXC's own, but a release
+#     build has no check there and would carry on, for better or worse.
+#   - release: an InnoDB ut_a or ut_error that release builds keep. A
+#     production build would die the same way.
+#   - unknown: an InnoDB site that the build-time table cannot place.
+# The harness forces none of these. It only reads the abort from the log.
+A_ASSERT_DEBUG_ANY="mysqld never fails an assertion that only debug builds check"
+A_ASSERT_DEBUG_ANY_LINE=5
 A_ASSERT_SITE_LINE=6
+A_ASSERT_RELEASE_ANY="mysqld never fails an assertion that release builds also check"
+A_ASSERT_RELEASE_ANY_LINE=12
+A_ASSERT_UNKNOWN_ANY="mysqld never fails an assertion of unknown build tier"
+A_ASSERT_UNKNOWN_ANY_LINE=13
+
+# gu_abort() is Galera stopping the process on purpose: it logs
+# "<program>: Terminated." (galerautils/src/gu_abort.c:46) and calls abort().
+# It is unconditional code, so a release build dies the same way. Until this
+# class existed these deaths fell into the undiagnosed catch-all below,
+# although the log says exactly what happened (run
+# 6a88fb9ba55565a5eed180ad68837c8d-63-3: a joiner whose donor answered
+# "State transfer ... failed: No message of desired type", then
+# "gcs_group.cpp:1379: Will never receive state. Need to abort."). Same shape
+# as unireg_abort below: a declared umbrella, and one property per cause,
+# keyed on the last [ERROR] before the Terminated line.
+A_GU_ABORT_UNDOCUMENTED="mysqld never calls gu_abort for an undocumented reason"
+A_GU_ABORT_UNDOCUMENTED_LINE=14
+A_GU_ABORT_CAUSE_LINE=15
 
 A_FATAL_SIGNAL_ANY="mysqld never dies on a fatal signal outside a failed assertion"
 A_FATAL_SIGNAL_ANY_LINE=7
@@ -185,6 +219,15 @@ UNIREG_DOCUMENTED_CAUSES=(
     '\[Galera\] failed to open gcomm backend connection: [0-9]+: failed to reach primary view \(pc\.wait_prim_timeout\)'
 )
 
+# Documented gu_abort causes, same rule as UNIREG_DOCUMENTED_CAUSES: add a
+# pattern ONLY with a source citation showing the abort is the intended
+# response to a condition the fault injector can create.
+# Deliberately empty for now. The one cause seen so far (a joiner whose donor
+# could not serve it) happened in a run with no faults, so it cannot be
+# excused as a fault response.
+GU_ABORT_DOCUMENTED_CAUSES=(
+)
+
 # Minimal JSON string escaping. The payload is one line of mysqld error log,
 # which routinely contains quotes, backslashes and stray control bytes.
 json_escape() {
@@ -214,7 +257,10 @@ sdk_unreachable() {
 
 # Declare every assertion in the catalog. Runs once, before the restart loop.
 sdk_declare_catalog() {
-    sdk_unreachable "${A_ASSERT_ANY}"            "${A_ASSERT_ANY_LINE}"            false
+    sdk_unreachable "${A_ASSERT_DEBUG_ANY}"      "${A_ASSERT_DEBUG_ANY_LINE}"      false
+    sdk_unreachable "${A_ASSERT_RELEASE_ANY}"    "${A_ASSERT_RELEASE_ANY_LINE}"    false
+    sdk_unreachable "${A_ASSERT_UNKNOWN_ANY}"    "${A_ASSERT_UNKNOWN_ANY_LINE}"    false
+    sdk_unreachable "${A_GU_ABORT_UNDOCUMENTED}" "${A_GU_ABORT_UNDOCUMENTED_LINE}" false
     sdk_unreachable "${A_FATAL_SIGNAL_ANY}"      "${A_FATAL_SIGNAL_ANY_LINE}"      false
     sdk_unreachable "${A_FATAL_EXIT_UNDIAGNOSED}" "${A_FATAL_EXIT_UNDIAGNOSED_LINE}" false
     sdk_unreachable "${A_UNIREG_UNDOCUMENTED}"   "${A_UNIREG_UNDOCUMENTED_LINE}"   false
@@ -475,6 +521,24 @@ fatal_exit_status() {
     return 1
 }
 
+# Build tier of one assertion site: debug_only, release or unknown.
+# $1 form (glibc|innodb)  $2 site as printed (FILE:LINE)
+assert_tier() {
+    local form="$1" site="$2" tier=""
+    # glibc assert() exists only without NDEBUG, which every release build
+    # defines. No lookup needed.
+    if [[ "${form}" == "glibc" ]]; then
+        printf 'debug_only'
+        return 0
+    fi
+    # InnoDB prints the same text for ut_a and ut_ad, so only the source can
+    # tell; assert_tiers.py read it at build time.
+    if [[ -r "${ASSERT_TIERS_FILE}" ]]; then
+        tier="$(awk -F'\t' -v k="${site}" '$1 == k { print $2; exit }' "${ASSERT_TIERS_FILE}")"
+    fi
+    printf '%s' "${tier:-unknown}"
+}
+
 # One failed-assertion property per crash site, for the boot that just ended.
 # Recognizes the two forms the build emits:
 #   mysqld: FILE:LINE: FUNC: Assertion `EXPR' failed.        (glibc assert)
@@ -482,10 +546,17 @@ fatal_exit_status() {
 # Only the FIRST in the boot is the one that killed it; later lines are
 # noise from the dying process.
 assert_failed_site() {
-    local slice="$1" hit file line func expr site component details
+    local slice="$1" hit file line func expr site component details form tier
+    local umbrella umbrella_line per_site has_check
     BUG_DEATH=0
+    # Set by a class that explained the death without calling it a bug (a
+    # documented gu_abort cause), so the undiagnosed catch-all stays quiet.
+    DIAGNOSED=0
     hit="$(grep -m1 -E "^mysqld: [^:]+:[0-9]+: .*: Assertion \`.*' failed\.|\[InnoDB\] Assertion failure: [^:]+:[0-9]+" <<< "${slice}")"
     if [[ -z "${hit}" ]]; then
+        # Not an assertion. gu_abort logs its own line, so it is told apart
+        # from a bare fatal signal before falling back to the signal.
+        gu_abort_death "${slice}" && return 0
         fatal_signal_without_assert "${slice}"
         return 0
     fi
@@ -493,10 +564,12 @@ assert_failed_site() {
     if [[ "${hit}" =~ ^mysqld:\ ([^:]+):([0-9]+):\ (.*):\ Assertion\ \`(.*)\'\ failed\.$ ]]; then
         file="${BASH_REMATCH[1]}"; line="${BASH_REMATCH[2]}"
         func="${BASH_REMATCH[3]}"; expr="${BASH_REMATCH[4]}"
+        form="glibc"
     elif [[ "${hit}" =~ Assertion\ failure:\ ([^:]+):([0-9]+):?(.*)$ ]]; then
         file="${BASH_REMATCH[1]}"; line="${BASH_REMATCH[2]}"
         func=""; expr="${BASH_REMATCH[3]}"
         expr="${expr%% thread [0-9]*}"
+        form="innodb"
     else
         return 0
     fi
@@ -505,16 +578,62 @@ assert_failed_site() {
     file="${file#/src/}"
     site="${file}:${line}"
     component="$(site_component "${file}")"
+    tier="$(assert_tier "${form}" "${site}")"
 
-    details="$(printf '{"node":"%s","boot":%d,"site":"%s","component":"%s","function":"%s","expression":"%s","exit_status":%d,"kind":"%s","log_line":"%s"}' \
+    # The tier goes into the property NAME, not only the details, so the
+    # report itself says whether a release build has this check.
+    case "${tier}" in
+        debug_only)
+            umbrella="${A_ASSERT_DEBUG_ANY}"; umbrella_line="${A_ASSERT_DEBUG_ANY_LINE}"
+            per_site="mysqld debug-only assertion failed at ${site}"; has_check=false ;;
+        release)
+            umbrella="${A_ASSERT_RELEASE_ANY}"; umbrella_line="${A_ASSERT_RELEASE_ANY_LINE}"
+            per_site="mysqld release-build assertion failed at ${site}"; has_check=true ;;
+        *)
+            tier="unknown"
+            umbrella="${A_ASSERT_UNKNOWN_ANY}"; umbrella_line="${A_ASSERT_UNKNOWN_ANY_LINE}"
+            per_site="mysqld assertion of unknown build tier failed at ${site}"; has_check='"unknown"' ;;
+    esac
+
+    details="$(printf '{"node":"%s","boot":%d,"site":"%s","component":"%s","function":"%s","expression":"%s","exit_status":%d,"kind":"%s","exit_cause":"%s","build_tier":"%s","release_build_has_this_check":%s,"log_line":"%s"}' \
         "${PXC_NODE_NAME}" "${BOOT_COUNT}" "$(json_escape "${site}")" "${component}" \
         "$(json_escape "${func}")" "$(json_escape "${expr}")" "${EXIT_STATUS}" "${EXIT_KIND}" \
+        "${tier}_assert" "${tier}" "${has_check}" \
         "$(json_escape "$(cut -c1-400 <<< "${hit}")")")"
 
     BUG_DEATH=1
-    sdk_unreachable "${A_ASSERT_ANY}" "${A_ASSERT_ANY_LINE}" true "${details}"
-    sdk_unreachable "mysqld assertion failed at $(json_escape "${site}")" "${A_ASSERT_SITE_LINE}" true "${details}"
-    emit "assertion_failed" "\"site\":\"$(json_escape "${site}")\",\"component\":\"${component}\""
+    sdk_unreachable "${umbrella}" "${umbrella_line}" true "${details}"
+    sdk_unreachable "$(json_escape "${per_site}")" "${A_ASSERT_SITE_LINE}" true "${details}"
+    emit "assertion_failed" "\"site\":\"$(json_escape "${site}")\",\"component\":\"${component}\",\"build_tier\":\"${tier}\""
+}
+
+# A gu_abort death: Galera logged "<program>: Terminated." and aborted.
+# Returns 1 when the slice has no such line, so the caller tries the next
+# class. Sets BUG_DEATH=1 unless the cause is on GU_ABORT_DOCUMENTED_CAUSES.
+gu_abort_death() {
+    local slice="$1" cause window pat key details
+    grep -qE '\[Galera\] .*: Terminated\.$' <<< "${slice}" || return 1
+    # The [ERROR] lines before the Terminated line are the cause; the lines
+    # after it ("Terminating SST process", SST script cleanup) are teardown.
+    cause="$(awk '/\[Galera\] .*: Terminated\.$/ { exit } /\[ERROR\]/ { print }' <<< "${slice}")"
+    window="$(tail -n 8 <<< "${cause}")"
+    for pat in "${GU_ABORT_DOCUMENTED_CAUSES[@]}"; do
+        if [[ -n "${window}" ]] && grep -qE -- "${pat}" <<< "${window}"; then
+            DIAGNOSED=1
+            return 0
+        fi
+    done
+
+    key="$(unireg_cause_key "$(tail -n 1 <<< "${cause}")")"
+    details="$(printf '{"node":"%s","boot":%d,"status":%d,"kind":"%s","exit_cause":"gu_abort","release_build_has_this_check":true,"cause":"%s","last_errors":"%s"}' \
+        "${PXC_NODE_NAME}" "${BOOT_COUNT}" "${EXIT_STATUS}" "${EXIT_KIND}" \
+        "$(json_escape "${key}")" \
+        "$(json_escape "$(tail -n 5 <<< "${cause}" | cut -c1-240 | tr '\n' '|')")")"
+    BUG_DEATH=1
+    sdk_unreachable "${A_GU_ABORT_UNDOCUMENTED}" "${A_GU_ABORT_UNDOCUMENTED_LINE}" true "${details}"
+    sdk_unreachable "mysqld called gu_abort after $(json_escape "${key}")" "${A_GU_ABORT_CAUSE_LINE}" true "${details}"
+    emit "gu_abort" "\"cause\":\"$(json_escape "${key}")\""
+    return 0
 }
 
 # A fatal signal with no assert line: SIGSEGV, or an abort() that printed no
@@ -530,7 +649,9 @@ fatal_signal_without_assert() {
     [[ -n "${hit}" ]] || return 0
     [[ "${hit}" =~ got\ (signal|exception)\ ([0-9]+) ]] || return 0
     sig="${BASH_REMATCH[2]}"
-    details="$(printf '{"node":"%s","boot":%d,"signal":%d,"exit_status":%d,"kind":"%s","log_line":"%s","last_error":"%s"}' \
+    # release_build_has_this_check is "unknown": a SIGSEGV or a bare abort in
+    # a Debug -O2 build may or may not happen the same way in a release build.
+    details="$(printf '{"node":"%s","boot":%d,"signal":%d,"exit_status":%d,"kind":"%s","exit_cause":"fatal_signal","release_build_has_this_check":"unknown","log_line":"%s","last_error":"%s"}' \
         "${PXC_NODE_NAME}" "${BOOT_COUNT}" "${sig}" "${EXIT_STATUS}" "${EXIT_KIND}" \
         "$(json_escape "$(cut -c1-300 <<< "${hit}")")" \
         "$(json_escape "$(grep -F '[ERROR]' <<< "${slice}" | tail -n 1 | cut -c1-300)")")"
@@ -590,7 +711,8 @@ unireg_abort_undocumented() {
     done
 
     key="$(unireg_cause_key "$(tail -n 1 <<< "${cause}")")"
-    details="$(printf '{"node":"%s","boot":%d,"status":%d,"kind":"%s","cause":"%s","last_errors":"%s"}' \
+    # unireg_abort is unconditional server code: a release build stops too.
+    details="$(printf '{"node":"%s","boot":%d,"status":%d,"kind":"%s","exit_cause":"unireg_abort","release_build_has_this_check":true,"cause":"%s","last_errors":"%s"}' \
         "${PXC_NODE_NAME}" "${BOOT_COUNT}" "${EXIT_STATUS}" "${EXIT_KIND}" \
         "$(json_escape "${key}")" \
         "$(json_escape "$(tail -n 5 <<< "${cause}" | cut -c1-240 | tr '\n' '|')")")"
@@ -612,9 +734,9 @@ assert_death_class() {
 
     assert_failed_site "${slice}"
 
-    if (( BUG_DEATH == 0 )) && fatal_exit_status; then
+    if (( BUG_DEATH == 0 && DIAGNOSED == 0 )) && fatal_exit_status; then
         BUG_DEATH=1
-        details="$(printf '{"node":"%s","boot":%d,"kind":"%s","status":%d,"signal":%d,"last_lines":"%s"}' \
+        details="$(printf '{"node":"%s","boot":%d,"kind":"%s","status":%d,"signal":%d,"exit_cause":"undiagnosed","release_build_has_this_check":"unknown","last_lines":"%s"}' \
             "${PXC_NODE_NAME}" "${BOOT_COUNT}" "${EXIT_KIND}" "${status}" "${EXIT_SIGNAL}" \
             "$(json_escape "$(tail -n 8 <<< "${slice}" | cut -c1-200 | tr '\n' '|')")")"
         sdk_unreachable "${A_FATAL_EXIT_UNDIAGNOSED}" "${A_FATAL_EXIT_UNDIAGNOSED_LINE}" true "${details}"

@@ -241,6 +241,53 @@ Notes:
   still a PXC finding. Use `../scratchbook/triage-scope.md` to decide if
   Percona owns the code.
 
+## Who ended the process
+
+The findings go to the Percona team, so every mysqld death in a report must
+say who ended the process. There are three kinds:
+
+| Kind | Meaning | Would a release build die the same way? |
+| --- | --- | --- |
+| PXC release behavior | PXC's shipped code decided to stop: `gu_abort()`, `unireg_abort`, an InnoDB `ut_a`/`ut_error` that release builds keep, a SIGSEGV. | Yes. It can be a bug or a designed response. |
+| Debug-only check | A check that exists only because this image is a Debug build: glibc `assert()` in mysqld, wsrep-lib or Galera (release builds define `NDEBUG`, see Galera's `SConstruct:92`), InnoDB `ut_ad`, or a `ut_a` inside `#ifdef UNIV_DEBUG`. | No. Release builds have no check there. The failed invariant is still Percona's own, but production would carry on, and what happens next is unknown. |
+| Harness- or fault-forced | An Antithesis kill, stop or pause, a lever (for example SQL `SHUTDOWN`), or the supervisor kill channel. | Not a PXC decision. |
+
+The harness never turns an assertion into a crash. It builds PXC with the
+checks on (`../Dockerfile`: mysqld `CMAKE_BUILD_TYPE=Debug`, Galera
+`debug=3`), and the supervisor (`../pxc-node/entrypoint.sh`) only reads the
+abort from the log afterwards. The one change to PXC's abort code is the
+`gu_abort()` patch, which only stops it from turning off core dumps.
+
+How the supervisor names each kind:
+
+| Property | Kind | `exit_cause` in the details |
+| --- | --- | --- |
+| `mysqld debug-only assertion failed at <site>` | Debug-only check | `debug_only_assert` |
+| `mysqld release-build assertion failed at <site>` | PXC release behavior | `release_assert` |
+| `mysqld assertion of unknown build tier failed at <site>` | Unknown: check the source line | `unknown_assert` |
+| `mysqld called gu_abort after <cause>` | PXC release behavior | `gu_abort` |
+| `mysqld stopped itself after <cause>` | PXC release behavior (`unireg_abort`) | `unireg_abort` |
+| `mysqld died on fatal signal <N> without a failed assertion` | Probably PXC release behavior; a Debug build can crash where a release build does not | `fatal_signal` |
+| `mysqld never dies on a fatal path without a diagnosable log line` | Unknown: read the log | `undiagnosed` |
+
+Each of these also has an umbrella property (for example `mysqld never fails
+an assertion that only debug builds check`), and the details carry
+`release_build_has_this_check` (`true`, `false` or `"unknown"`).
+
+For an InnoDB `Assertion failure`, the build stage `assert-tiers` runs
+`../pxc-node/assert_tiers.py` over the source and writes the verdict per
+FILE:LINE. A glibc `assert()` is always debug-only. A site that the table
+cannot place is `unknown`, never guessed.
+
+When you write up a finding:
+
+- State the kind and cite the source line.
+- For a debug-only check, say what the invariant protects and what a release
+  build would do instead, if you can show it. Do not call it a production
+  crash.
+- A kind-3 death is not a PXC finding by itself. What PXC does afterwards (a
+  rejoin, an SST) can be.
+
 ## Known gaps
 
 - The kill channel is not used. To test ungraceful death, either enable

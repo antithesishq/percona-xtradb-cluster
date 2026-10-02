@@ -145,8 +145,14 @@ glibc's `mysqld: FILE:LINE: FUNC: Assertion `EXPR' failed.` and InnoDB's
 properties:
 
 - `mysqld never aborts on a failed assertion`: declared at startup, so it
-  shows passing when nothing aborts.
+  shows passing when nothing aborts. Since 2026-10-02 split by build tier into
+  `mysqld never fails an assertion that only debug builds check`, `... that
+  release builds also check` and `... of unknown build tier`
+  (`pxc-node/assert_tiers.py` decides InnoDB sites at build time).
 - `mysqld assertion failed at <file>:<line>`: one per site, built at run time.
+  Since 2026-10-02 named `mysqld debug-only assertion failed at ...`,
+  `mysqld release-build assertion failed at ...` or `mysqld assertion of
+  unknown build tier failed at ...`.
   This is the one deliberate exception to the inline-constant id rule. An
   undeclared Unreachable loses nothing, because absent and passing mean the
   same, and the platform evaluates undeclared assertions on first sight.

@@ -101,9 +101,11 @@ unfired claim still reports):
 
 **These four are coverage signals and pass when seen.** Since 2026-09-28 they
 skip any boot that ended in a failed assertion or a fatal signal. Those deaths
-are bugs, reported instead by the `Unreachable`s `mysqld assertion failed at
-<file>:<line>` and `mysqld died on fatal signal <N> without a failed assertion`,
-which fail when seen. Before that gate, every assert abort also turned the
+are bugs, reported instead by the `Unreachable`s `mysqld debug-only assertion
+failed at <file>:<line>` (or `release-build assertion` / `assertion of unknown
+build tier`, since 2026-10-02), `mysqld called gu_abort after <cause>` and
+`mysqld died on fatal signal <N> without a failed assertion`, which fail when
+seen. See "Who ended the process" in `../workload/README.md`. Before that gate, every assert abort also turned the
 "would not restart" claim greener (460 passes in `c89f2f7a…-63-2`).
 
 **Undocumented `unireg_abort` is a bug since 2026-09-28 (unbuilt).** A

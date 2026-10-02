@@ -40,7 +40,8 @@ BOOT = """\
 """
 
 FUNCS = ["json_escape", "sdk_reachable", "sdk_unreachable", "sdk_declare_catalog",
-         "site_component", "fatal_exit_status", "assert_failed_site",
+         "site_component", "fatal_exit_status", "assert_tier", "assert_failed_site",
+         "gu_abort_death",
          "fatal_signal_without_assert", "unireg_cause_lines", "unireg_cause_key",
          "unireg_abort_undocumented", "assert_death_class"]
 
@@ -55,6 +56,7 @@ def extract():
     parts = [
         subprocess.run(["awk", "/^A_[A-Z_]+=/"], stdin=open(ENTRY), capture_output=True, text=True, check=True).stdout,
         subprocess.run(["awk", "/^UNIREG_DOCUMENTED_CAUSES=\\(/,/^\\)/"], stdin=open(ENTRY), capture_output=True, text=True, check=True).stdout,
+        subprocess.run(["awk", "/^GU_ABORT_DOCUMENTED_CAUSES=\\(/,/^\\)/"], stdin=open(ENTRY), capture_output=True, text=True, check=True).stdout,
     ]
     for f in FUNCS:
         body = subprocess.run(["awk", f"/^{f}\\(\\) \\{{/,/^\\}}/"], stdin=open(ENTRY),
