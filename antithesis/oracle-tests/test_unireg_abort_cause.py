@@ -43,7 +43,7 @@ FUNCS = ["json_escape", "sdk_reachable", "sdk_unreachable", "sdk_declare_catalog
          "site_component", "fatal_exit_status", "assert_tier", "assert_failed_site",
          "gu_abort_death",
          "fatal_signal_without_assert", "unireg_cause_lines", "unireg_cause_key",
-         "unireg_abort_undocumented", "assert_death_class"]
+         "unireg_abort_undocumented", "assert_death_class", "drop_session_errors"]
 
 UMBRELLA = "[prod] mysqld never stops itself for an undocumented reason"
 COVERAGE = {"[coverage] a node died in a way the shipped systemd unit would not restart",
@@ -156,6 +156,21 @@ ev = run(head + "\n")
 ids = [a["id"] for a in unreach(ev)]
 check("silent exit 1 fails, keyed as having no ERROR line",
       UMBRELLA in ids and "[prod] mysqld stopped itself after no [ERROR] line before exit" in ids, ev)
+
+# 5b. A client session's strict-mode verdict before Aborting is not the cause,
+#     but the same verdict from the startup check (thread 0) is.
+strict = "Percona-XtraDB-Cluster doesn't recommend using SERIALIZABLE isolation with pxc_strict_mode = ENFORCING"
+lines = no_prim.splitlines(keepends=True)
+ab = next(i for i, l in enumerate(lines) if "[MY-010119] [Server] Aborting" in l)
+sess = "".join(lines[:ab]) + f"2026-09-28T20:14:13.320977Z 4198 [ERROR] [MY-000000] [WSREP] {strict}\n" + "".join(lines[ab:])
+ev = run(sess)
+check("a session's strict-mode ERROR before Aborting is not the key",
+      key in [a["id"] for a in unreach(ev)], ev)
+boot = ("2026-09-28T20:13:42.320000Z 0 [ERROR] [MY-000000] [WSREP] Percona-XtraDB-Cluster prohibits use of MyISAM "
+        "table replication with pxc_strict_mode = ENFORCING or MASTER\n")
+ev = run(head + "\n" + boot + "2026-09-28T20:13:42.320001Z 0 [ERROR] [MY-010119] [Server] Aborting\n")
+check("a startup (thread 0) strict-mode ERROR stays the key",
+      any("prohibits use of MyISAM" in a["id"] for a in unreach(ev)), ev)
 
 # 6. Other exit kinds never reach the new check.
 ev = run(no_prim, kind="crash", status=137, signal=9, field="true")

@@ -34,7 +34,8 @@ REPO = HERE.parent.parent
 FUNCS = ["json_escape", "sdk_reachable", "sdk_unreachable", "sdk_declare_catalog",
          "site_component", "fatal_exit_status", "assert_tier", "assert_failed_site",
          "gu_abort_death", "fatal_signal_without_assert", "unireg_cause_lines",
-         "unireg_cause_key", "unireg_abort_undocumented", "assert_death_class"]
+         "unireg_cause_key", "unireg_abort_undocumented", "assert_death_class",
+         "drop_session_errors"]
 
 START = "2026-10-02T13:09:40.673440Z 0 [System] [MY-015015] [Server] MySQL Server - start.\n"
 
@@ -177,6 +178,23 @@ check("gu_abort is not reported as undiagnosed", UNDIAGNOSED not in ids(ev), ev)
 # 7. Detection: the pre-change classification called it undiagnosed.
 ev = run(GU_ABORT, stub="gu_abort_death() { return 1; }")
 check("detection: without the class, gu_abort lands in undiagnosed", ids(ev) == {UNDIAGNOSED}, ev)
+
+# 7b. A client session's pxc_strict_mode verdict logged between the real
+#     cause and Terminated must not become the key. Lines from run
+#     8fd9e28bf16da1132b1c9fe934a8219f-63-5, node3 boot 1 (vtime 130-131).
+SERIAL = ("2026-10-05T20:21:44.982553Z 4198 [ERROR] [MY-000000] [WSREP] Percona-XtraDB-Cluster "
+          "doesn't recommend using SERIALIZABLE isolation with pxc_strict_mode = ENFORCING\n")
+gl = GU_ABORT.splitlines(keepends=True)
+term = next(i for i, l in enumerate(gl) if l.rstrip().endswith("Terminated."))
+GU_ABORT_SERIAL = "".join(gl[:term]) + SERIAL + "".join(gl[term:])
+ev = run(GU_ABORT_SERIAL)
+check("gu_abort key ignores a session's strict-mode ERROR before Terminated",
+      ids(ev) == {GU_ANY, key}, ev)
+check("gu_abort last_errors leave out the strict-mode line",
+      "SERIALIZABLE" not in det(ev, GU_ANY)["last_errors"])
+ev = run(GU_ABORT_SERIAL, stub="drop_session_errors() { cat; }")
+check("detection: without the filter, the strict-mode line becomes the key",
+      any("SERIALIZABLE" in i for i in ids(ev)), ev)
 
 # 8. Bare SIGSEGV: unchanged names, labeled as unknown for release.
 ev = run(SEGV, kind="exit", status=2, signal=0)

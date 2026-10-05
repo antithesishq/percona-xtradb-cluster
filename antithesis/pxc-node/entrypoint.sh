@@ -615,7 +615,8 @@ gu_abort_death() {
     grep -qE '\[Galera\] .*: Terminated\.$' <<< "${slice}" || return 1
     # The [ERROR] lines before the Terminated line are the cause; the lines
     # after it ("Terminating SST process", SST script cleanup) are teardown.
-    cause="$(awk '/\[Galera\] .*: Terminated\.$/ { exit } /\[ERROR\]/ { print }' <<< "${slice}")"
+    cause="$(awk '/\[Galera\] .*: Terminated\.$/ { exit } /\[ERROR\]/ { print }' <<< "${slice}" \
+        | drop_session_errors)"
     window="$(tail -n 8 <<< "${cause}")"
     for pat in "${GU_ABORT_DOCUMENTED_CAUSES[@]}"; do
         if [[ -n "${window}" ]] && grep -qE -- "${pat}" <<< "${window}"; then
@@ -672,7 +673,20 @@ unireg_cause_lines() {
         END {
             if (!seen) { kn = n; for (i = 0; i < n; i++) k[i] = b[i] }
             for (i = 0; i < kn; i++) print k[i]
-        }' <<< "$1"
+        }' <<< "$1" | drop_session_errors
+}
+
+# Drop the pxc_strict_mode verdicts that client sessions log from a list of
+# [ERROR] lines. A session logs one at ERROR for each statement or SET it
+# checks (sql/sys_vars.cc, sql/sql_parse.cc, ...: "Percona-XtraDB-Cluster
+# doesn't recommend ..." / "... prohibits ..."), so under concurrent traffic
+# they interleave with the server's own fatal chain. Run 8fd9e28b-63-5 filed
+# 18 "Will never receive state" aborts as "gu_abort after ... SERIALIZABLE"
+# because the workload's SERIALIZABLE sessions logged last.
+# Only client threads (id != 0): the same verdict from the startup checks in
+# sql/mysqld.cc runs on thread 0 and IS the cause of the unireg_abort after it.
+drop_session_errors() {
+    grep -vE "Z [1-9][0-9]* \[ERROR\] \[MY-[0-9]+\] \[WSREP\] Percona-XtraDB-Cluster (doesn't recommend|prohibits) " || true
 }
 
 # Property key for one unireg_abort cause, from the last [ERROR] before
