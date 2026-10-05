@@ -192,6 +192,21 @@ def _merge_progress(
     return dict(row)
 
 
+def _break_green(jr, node: str) -> None:
+    """End the node's green run without any other observation.
+
+    For a sample whose status could not be read. Same NULL-from-the-observer
+    rule as _merge_progress: every other field is left alone, because an
+    unreadable node says nothing about commits or probe outcomes.
+    """
+    with jr.conn:
+        jr.conn.execute(
+            "UPDATE progress SET advertised_since = NULL, advertised_fc_paused = NULL "
+            "WHERE node = ?",
+            (node,),
+        )
+
+
 def run() -> int:
     """Entry point. Never exits non-zero for an environment condition.
 
@@ -311,6 +326,12 @@ def _run() -> int:
                 prog = _progress_row(jr, name)
 
                 if st is None:
+                    # A sample we could not take is a gap in the green run,
+                    # not a continuation of it. Run 8fd9e28b-63-5: node3's own
+                    # log shows it non-Primary at least five times inside one
+                    # "148 s green" window, under partitions that also cut it
+                    # off from the workload.
+                    _break_green(jr, name)
                     continue
 
                 try:
@@ -392,6 +413,16 @@ def _run() -> int:
                     # judged without a usable probe, so drop the green window
                     # with it.
                     green = False
+                elif green:
+                    # The status above was read before the maint-mode read and
+                    # the probe write, seconds earlier under faults. Only call
+                    # the node green if it still is now that the write is
+                    # done: in run 8fd9e28b-63-5 a Primary/Synced read paired
+                    # with a write the node refused (1047) because it had
+                    # left the primary component in between. A wedged node
+                    # still answers this read green, so a real wedge is
+                    # still judged.
+                    green = db.clustercheck_green(db.node_status(host), maint)
 
                 # ---------------------------------------------- wedge watchdog
                 # Everyone claims Synced and Primary, nobody is transferring

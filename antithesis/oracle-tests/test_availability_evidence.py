@@ -11,6 +11,13 @@ carried last_probe_commit_age_s = null:
   2. The claim treated "no successful probe is on record" as "the node refused
      writes", so missing data fired a safety property.
 
+Two more from run 8fd9e28bf16da1132b1c9fe934a8219f-63-5 (76 counterexamples):
+
+  3. A sample whose status could not be read was skipped without ending the
+     green run, so a node that left Primary while unreadable stayed "green".
+  4. The status was read seconds before the probe write, so a node that left
+     Primary in between paired a green read with a refused write.
+
 These are detection tests: each one also checks that the REAL condition -- a
 green node that genuinely refuses writes for the whole window -- is still
 caught.
@@ -166,10 +173,13 @@ class FakeConn:
         raise AssertionError("unexpected cursor use")
 
 
-def drive(outcomes, *, maint="DISABLED", ticks=25, preseed=None):
+def drive(outcomes, *, maint="DISABLED", ticks=25, preseed=None, before=None, after=None):
     """Run the real loop for `ticks` iterations. `outcomes` is a per-tick list.
 
     Returns the assertion records the availability property produced.
+    `before` and `after` are per-tick lists of the status read at the top of
+    the loop and the one re-read after the probe write; an entry of None is a
+    node that could not be read. Both default to a steady Synced node.
     """
     A.FIRED.clear()
     for f in pathlib.Path(JOURNAL_DIR).glob("*"):
@@ -181,7 +191,17 @@ def drive(outcomes, *, maint="DISABLED", ticks=25, preseed=None):
     config.NODES = [("node1", "10.0.0.1")]
     config.EXPECTED_CLUSTER_SIZE = 3
     config.PROBE_WALL_BUDGET_SECONDS = float(ticks)
-    db.cluster_status = lambda: {"node1": dict(STATUS)}
+    tick = {"before": 0, "after": 0}
+
+    def nth(seq, key):
+        if seq is None:
+            return dict(STATUS)
+        i = min(tick[key], len(seq) - 1)
+        tick[key] += 1
+        return None if seq[i] is None else dict(seq[i])
+
+    db.cluster_status = lambda: {"node1": nth(before, "before")}
+    db.node_status = lambda host: nth(after, "after")
     db.connect_with_retry = lambda *a, **k: FakeConn()
     db.close_quietly = lambda c: None
     db.global_vars = lambda conn, names: ({} if maint is None else {"pxc_maint_mode": maint})
@@ -270,6 +290,48 @@ check(
 fired = drive([probe.PROBE_NO_SCHEMA])
 check(
     "a probe that cannot address the schema is never judged",
+    not fired,
+    f"{len(fired)} evaluations",
+)
+
+# Run 8fd9e28b-63-5: samples the probe could not take kept a green run alive
+# across the node's non-Primary spells, and a status read taken seconds before
+# the write paired Primary/Synced with a 1047 refusal.
+NONPRIM = dict(STATUS, wsrep_cluster_status="non-Primary", wsrep_local_state="0")
+gappy = ([STATUS] * 4 + [None]) * 8          # unreadable every 5th sample
+
+fired = drive([probe.PROBE_FAILED], ticks=40, before=gappy)
+check(
+    "an unreadable sample breaks the green run",
+    not any(not r["cond"] for r in fired),
+    f"{sum(1 for r in fired if not r['cond'])} counterexamples",
+)
+orig = probe._break_green
+probe._break_green = lambda jr, node: None
+fired = drive([probe.PROBE_FAILED], ticks=40, before=gappy)
+probe._break_green = orig
+check(
+    "detection: without the break, the same gappy history fires",
+    any(not r["cond"] for r in fired),
+    f"{sum(1 for r in fired if not r['cond'])} counterexamples",
+)
+
+flappy = ([STATUS] * 4 + [NONPRIM]) * 8      # non-Primary by the time of every 5th write
+fired = drive([probe.PROBE_FAILED], ticks=40, after=flappy)
+check(
+    "a node that left Primary before the write landed is not judged green",
+    not any(not r["cond"] for r in fired),
+    f"{sum(1 for r in fired if not r['cond'])} counterexamples",
+)
+fired = drive([probe.PROBE_FAILED], ticks=40, after=[STATUS])
+check(
+    "detection: the same refusals on a node green before AND after still fire",
+    any(not r["cond"] for r in fired),
+    f"{sum(1 for r in fired if not r['cond'])} counterexamples",
+)
+fired = drive([probe.PROBE_FAILED], ticks=40, after=[None])
+check(
+    "a node that cannot be re-read after the write is not judged green",
     not fired,
     f"{len(fired)} evaluations",
 )
