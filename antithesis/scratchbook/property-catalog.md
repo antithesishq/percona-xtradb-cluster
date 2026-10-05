@@ -188,7 +188,7 @@ already documents for tables, one level down:
   exactly: 29 failed scratch DDLs, 29 voting rounds. All three shapes now read
   the server's catalog and emit whichever direction is legal, and skip entirely
   when the lookup fails or the table is momentarily absent. New reach claim
-  `a data-definition statement dropped an object the catalog reported present`
+  `[coverage] a data-definition statement dropped an object the catalog reported present`
   guards the lookup itself: a lookup that silently returned nothing would
   degrade the generator into create-only, and nothing else would say so.
   Foreign key names are scoped per **schema** in MySQL 8, not per table, so that
@@ -1508,7 +1508,7 @@ Priority: **High** — oracle-integrity property; the deadlock is verified reach
 | **Antithesis Angle** | VERIFIED: `log_view` — the forced flag's SOLE writer (tree-wide sweep) — force-flips the mode (`wsrep_server_service.cc:196-231`), and an operator SET never clears the forced flag (update fn is a no-op, `wsrep_var.cc:1096`). Release-reachable with plain network faults: every NON-PRIMARY view carries `appl_proto_ver = -1` (`GCS_QUORUM_NON_PRIMARY`, `gcs_state_msg.hpp:78-85`), `log_view` runs for ALL view statuses, and -1 < V4 forces MAINTENANCE + the forced flag under default ENFORCING; the next primary view force-reverts to DISABLED. An operator drain set before/during the partition is thus silently ERASED at heal — the node re-enters rotation mid-maintenance. The DBUG multi-major knob remains a debug-image amplifier, not a prerequisite. (The earlier 10s-SET-sleep-holds-MDL claim is retracted — the sleep holds no MDL and only delays the operator's session.) |
 | **Why It Matters** | clustercheck requires DISABLED for 200 → a spurious flip returns a draining node to rotation mid-maintenance; forced-MAINTENANCE cluster-wide = all-503 blackhole. The forced-flip/revert hijack of operator intent is a real release-build finding reachable with default network faults. |
 
-**Implemented as:** `an operator-set pxc_maint_mode=MAINTENANCE is never reverted to DISABLED`
+**Implemented as:** `[prod] an operator-set pxc_maint_mode=MAINTENANCE is never reverted to DISABLED`
 (`always_or_unreachable`, `workload/pxcwl/levers.py::maint_mode_cycle`). Renamed 2026-09-23
 from "pxc_maint_mode matches the last operator-set value until the operator changes it",
 which promised a two-way equality this property never meant. Carve-outs: `observed ==

@@ -55,7 +55,7 @@ class FakeJR:
 
 # ======================================================================= 1
 print("--- applier_resize")
-RESIZE = "applier thread count reaches the configured setpoint after a resize"
+RESIZE = "[prod] applier thread count reaches the configured setpoint after a resize"
 SYNCED = {"wsrep_connected": "ON", "wsrep_local_state": "4",
           "wsrep_cluster_status": "Primary", "wsrep_local_state_comment": "Synced",
           "wsrep_last_committed": "10"}

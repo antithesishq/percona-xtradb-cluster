@@ -22,7 +22,7 @@ ships, what is deliberately deferred, and the exact flip needed to un-defer it.
 | Service | Language / build | Instrumented? | SDK in dep graph | Catalog / symbols | Bootstrap property |
 |---|---|---|---|---|---|
 | `pxc-node1/2/3` (`mysqld` + `libgalera_smm.so`) | C++ / cmake (server) + scons (galera), GCC | **No** (deferred — see below) | No | `/symbols` **created and populated** with unstripped `mysqld` + `libgalera_smm.so` (harmless without libvoidstar; ready for the flip) | n/a — asserts are the oracle on this tier |
-| `pxc-workload` | Python 3 (Debian python3) | **Cataloging-only** (the only mode Python supports today) | **Yes** — `antithesis==0.3.1` | `/opt/antithesis/catalog/` → one-hop symlink to `/opt/antithesis/workload` | **Yes** — `reachable("workload startup: 3-node cluster reached Synced")` |
+| `pxc-workload` | Python 3 (Debian python3) | **Cataloging-only** (the only mode Python supports today) | **Yes** — `antithesis==0.3.1` | `/opt/antithesis/catalog/` → one-hop symlink to `/opt/antithesis/workload` | **Yes** — `reachable("[coverage] workload startup: 3-node cluster reached Synced")` |
 
 ## Decision 1 — C/C++ coverage instrumentation is DEFERRED in v1
 
@@ -95,7 +95,7 @@ In `antithesis/workload/entrypoint.py`, immediately after the readiness gate pro
 all three nodes are `Synced` / `Primary` / `cluster_size=3` on a single state UUID:
 
 ```python
-reachable("workload startup: 3-node cluster reached Synced")
+reachable("[coverage] workload startup: 3-node cluster reached Synced")
 ```
 
 It satisfies the skill's requirements: it is a `reachable` (not a business invariant),
@@ -146,12 +146,12 @@ properties:
 
 - `mysqld never aborts on a failed assertion`: declared at startup, so it
   shows passing when nothing aborts. Since 2026-10-02 split by build tier into
-  `mysqld never fails an assertion that only debug builds check`, `... that
+  `[debug-only] mysqld never fails an assertion`, `... that
   release builds also check` and `... of unknown build tier`
   (`pxc-node/assert_tiers.py` decides InnoDB sites at build time).
 - `mysqld assertion failed at <file>:<line>`: one per site, built at run time.
-  Since 2026-10-02 named `mysqld debug-only assertion failed at ...`,
-  `mysqld release-build assertion failed at ...` or `mysqld assertion of
+  Since 2026-10-02 named `[debug-only] mysqld assertion failed at ...`,
+  `[prod] mysqld assertion failed at ...` or `mysqld assertion of
   unknown build tier failed at ...`.
   This is the one deliberate exception to the inline-constant id rule. An
   undeclared Unreachable loses nothing, because absent and passing mean the
@@ -169,7 +169,7 @@ sees a normal exit with status 2, so a crash detector that counts deaths by
 signal misses most of them. In `c89f2f7a…-63-2` the supervisor recorded 213
 status-2 exits and 96 SIGABRT (134) exits, plus 150 `unireg_abort` (1). The
 supervisor therefore also emits
-`mysqld died on fatal signal <N> without a failed assertion` (plus a declared
+`[prod?] mysqld died on fatal signal <N> without a failed assertion` (plus a declared
 umbrella) when a boot's log has `mysqld got signal N` but no assert line. That
 case covers SIGSEGV and expression-less aborts. The run had 219 `got signal 6`
 lines, 179 assert lines, and 2 `got signal 11`.
@@ -189,8 +189,8 @@ matches the last 8 against `UNIREG_DOCUMENTED_CAUSES` in `entrypoint.sh`. Each
 pattern there carries a source citation. A match stays coverage: only the four
 reach claims fire. No match emits two `Unreachable`s and sets `BUG_DEATH=1`:
 
-- `mysqld never stops itself for an undocumented reason`: declared at startup.
-- `mysqld stopped itself after <key>`: one per cause. The key is the MY-code
+- `[prod] mysqld never stops itself for an undocumented reason`: declared at startup.
+- `[prod] mysqld stopped itself after <key>`: one per cause. The key is the MY-code
   and subsystem of the last `[ERROR]` before Aborting (`MY-012981 [InnoDB]`).
   Every Galera and WSREP line logs `MY-000000`, so for that code alone the key
   also carries the message, with addresses, UUIDs and 3+ digit numbers

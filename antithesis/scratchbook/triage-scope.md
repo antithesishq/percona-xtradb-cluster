@@ -94,17 +94,17 @@ unfired claim still reports):
 
 | Claim | Fires when |
 | --- | --- |
-| `a node died in a way the shipped systemd unit would not restart` | any non-graceful exit with `field_would_restart:false` |
-| `a node died before mysqld reached ready for connections` | the boot never logged "ready for connections" |
-| `a node died in a boot whose state transfer had failed` | the boot's log slice shows an SST failure |
-| `a node died after the cluster declared it inconsistent` | the boot's log slice shows `Inconsistency detected` |
+| `[coverage] a node died in a way the shipped systemd unit would not restart` | any non-graceful exit with `field_would_restart:false` |
+| `[coverage] a node died before mysqld reached ready for connections` | the boot never logged "ready for connections" |
+| `[coverage] a node died in a boot whose state transfer had failed` | the boot's log slice shows an SST failure |
+| `[coverage] a node died after the cluster declared it inconsistent` | the boot's log slice shows `Inconsistency detected` |
 
 **These four are coverage signals and pass when seen.** Since 2026-09-28 they
 skip any boot that ended in a failed assertion or a fatal signal. Those deaths
-are bugs, reported instead by the `Unreachable`s `mysqld debug-only assertion
-failed at <file>:<line>` (or `release-build assertion` / `assertion of unknown
-build tier`, since 2026-10-02), `mysqld called gu_abort after <cause>` and
-`mysqld died on fatal signal <N> without a failed assertion`, which fail when
+are bugs, reported instead by the `Unreachable`s `[debug-only] mysqld assertion
+failed at <file>:<line>` (or `[prod]` / `[prod?]` for a release-build or
+unplaced site, since 2026-10-02), `[prod] mysqld called gu_abort after <cause>` and
+`[prod?] mysqld died on fatal signal <N> without a failed assertion`, which fail when
 seen. See "Who ended the process" in `../workload/README.md`. Before that gate, every assert abort also turned the
 "would not restart" claim greener (460 passes in `c89f2f7a…-63-2`).
 
@@ -113,8 +113,8 @@ seen. See "Who ended the process" in `../workload/README.md`. Before that gate, 
 `Aborting` match a cited pattern in `UNIREG_DOCUMENTED_CAUSES`
 (`pxc-node/entrypoint.sh`). Today the list holds only `pc.wait_prim_timeout`,
 the only cause in runs `c89f2f7a…-63-2` and `93ec5045…-63-2`. Any other cause
-fails `mysqld never stops itself for an undocumented reason` and
-`mysqld stopped itself after <MY-code> [<subsystem>]`, and it skips the four
+fails `[prod] mysqld never stops itself for an undocumented reason` and
+`[prod] mysqld stopped itself after <MY-code> [<subsystem>]`, and it skips the four
 coverage claims. Triage those by caller, like an assert site. A `[Galera]` or
 `[WSREP]` key is Percona's. An upstream subsystem key (`[InnoDB]`, `[Server]`)
 needs the log to show whether a wsrep path got it there. Widen the allowlist
@@ -128,7 +128,7 @@ from a silent one without a pattern list deciding the verdict.
 The surviving-node half is in the workload (`probe.py` `_claim_error_log`, via
 `performance_schema.error_log`): `a live node's error log recorded a failed
 state transfer`, `a failed state transfer fell back to IST instead of killing
-the node`, and `a live node's error log recorded an inconsistency verdict`.
+the node`, and `[coverage] a live node's error log recorded an inconsistency verdict`.
 Before 2026-09-28 the first and last were named "…kept serving" and "…was still
 serving". The new names describe what is observed. The two halves
 cover each other's blind spot — the supervisor cannot see a node that survives,
@@ -139,7 +139,7 @@ themselves inconsistent at once. No single component observes it: the supervisor
 sees only its own node, and the workload usually cannot poll a node between its
 verdict and its death. It needs the per-node verdicts accumulated in the journal
 and asserted over a window. Until then it shows up as the terminal reconvergence
-reds plus three `a node died after the cluster declared it inconsistent` claims
+reds plus three `[coverage] a node died after the cluster declared it inconsistent` claims
 in the same history.
 
 ## Corollary for oracle (SDK property) failures

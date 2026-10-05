@@ -142,7 +142,7 @@ workload design regardless: they are the general double-apply oracle.
 
 ## Triage refinement (2026-09-24, run 5aa4afb557ee963d484ffea49f9a0ad4-63-0)
 
-- Found: "a cleanly failed write is absent from every Synced node" went red with 8
+- Found: "[prod] a cleanly failed write is absent from every Synced node" went red with 8
   consecutive FAILED wids (inv 3, seq 1-8) present on all three nodes, with no faults
   active. The details carried only wids, so the operation and errno were unrecoverable.
   Separately, `CLEAN_REJECTIONS` included 1105, 1205 and 1317, all of which the wsrep

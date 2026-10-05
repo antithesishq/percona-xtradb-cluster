@@ -412,7 +412,7 @@ anything changed.
 Start short — 15-30 minutes — to confirm the system comes up, then read the
 triage report for:
 
-- the bootstrap property `workload startup: 3-node cluster reached Synced`;
+- the bootstrap property `[coverage] workload startup: 3-node cluster reached Synced`;
 - session errors under `No Antithesis session errors` (symbolization problems
   show up here);
 - `Software was instrumented` under `Setup` — this will **not** appear for

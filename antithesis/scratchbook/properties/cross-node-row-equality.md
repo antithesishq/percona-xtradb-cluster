@@ -214,7 +214,7 @@ that run was `gcs/src/gcs_node.cpp:224`, `assert(node->last_applied >= 0)`,
 immediately after `gcs_state_msg_last_vote()` reads the vote fields from a
 peer's state message: 93 aborts, the same code path.
 
-`every Synced node agrees on the set of tables and indexes` failed in the same
+`[prod] every Synced node agrees on the set of tables and indexes` failed in the same
 window with node1 permanently missing `wl_scratch_ephemeral` (15 tables vs 16,
 17 index rows vs 18) while all three reported Synced on one state UUID.
 

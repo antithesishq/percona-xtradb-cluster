@@ -120,16 +120,16 @@ if [[ -n "${ANTITHESIS_OUTPUT_DIR:-}" ]]; then
     SDK_FILE="${ANTITHESIS_OUTPUT_DIR}/sdk.jsonl"
 fi
 
-A_DIED_UNRESTARTABLE="a node died in a way the shipped systemd unit would not restart"
+A_DIED_UNRESTARTABLE="[coverage] a node died in a way the shipped systemd unit would not restart"
 A_DIED_UNRESTARTABLE_LINE=1
 
-A_DIED_IN_STARTUP="a node died before mysqld reached ready for connections"
+A_DIED_IN_STARTUP="[coverage] a node died before mysqld reached ready for connections"
 A_DIED_IN_STARTUP_LINE=2
 
-A_DIED_AFTER_SST_FAILURE="a node died in a boot whose state transfer had failed"
+A_DIED_AFTER_SST_FAILURE="[coverage] a node died in a boot whose state transfer had failed"
 A_DIED_AFTER_SST_FAILURE_LINE=3
 
-A_DIED_INCONSISTENT="a node died after the cluster declared it inconsistent"
+A_DIED_INCONSISTENT="[coverage] a node died after the cluster declared it inconsistent"
 A_DIED_INCONSISTENT_LINE=4
 
 # The server's own invariants, as properties. Until these existed, every
@@ -158,12 +158,12 @@ A_DIED_INCONSISTENT_LINE=4
 #     production build would die the same way.
 #   - unknown: an InnoDB site that the build-time table cannot place.
 # The harness forces none of these. It only reads the abort from the log.
-A_ASSERT_DEBUG_ANY="mysqld never fails an assertion that only debug builds check"
+A_ASSERT_DEBUG_ANY="[debug-only] mysqld never fails an assertion"
 A_ASSERT_DEBUG_ANY_LINE=5
 A_ASSERT_SITE_LINE=6
-A_ASSERT_RELEASE_ANY="mysqld never fails an assertion that release builds also check"
+A_ASSERT_RELEASE_ANY="[prod] mysqld never fails an assertion"
 A_ASSERT_RELEASE_ANY_LINE=12
-A_ASSERT_UNKNOWN_ANY="mysqld never fails an assertion of unknown build tier"
+A_ASSERT_UNKNOWN_ANY="[prod?] mysqld never fails an assertion of unknown build tier"
 A_ASSERT_UNKNOWN_ANY_LINE=13
 
 # gu_abort() is Galera stopping the process on purpose: it logs
@@ -176,11 +176,11 @@ A_ASSERT_UNKNOWN_ANY_LINE=13
 # "gcs_group.cpp:1379: Will never receive state. Need to abort."). Same shape
 # as unireg_abort below: a declared umbrella, and one property per cause,
 # keyed on the last [ERROR] before the Terminated line.
-A_GU_ABORT_UNDOCUMENTED="mysqld never calls gu_abort for an undocumented reason"
+A_GU_ABORT_UNDOCUMENTED="[prod] mysqld never calls gu_abort for an undocumented reason"
 A_GU_ABORT_UNDOCUMENTED_LINE=14
 A_GU_ABORT_CAUSE_LINE=15
 
-A_FATAL_SIGNAL_ANY="mysqld never dies on a fatal signal outside a failed assertion"
+A_FATAL_SIGNAL_ANY="[prod?] mysqld never dies on a fatal signal outside a failed assertion"
 A_FATAL_SIGNAL_ANY_LINE=7
 A_FATAL_SIGNAL_LINE=8
 
@@ -190,7 +190,7 @@ A_FATAL_SIGNAL_LINE=8
 # SIGKILL (the workload kill channel) and SIGTERM (container stop), so those
 # two are excluded. This is what makes "every crash fails a property" hold
 # even when the log slice has no parsable line.
-A_FATAL_EXIT_UNDIAGNOSED="mysqld never dies on a fatal path without a diagnosable log line"
+A_FATAL_EXIT_UNDIAGNOSED="[prod?] mysqld never dies on a fatal path without a diagnosable log line"
 A_FATAL_EXIT_UNDIAGNOSED_LINE=9
 
 # unireg_abort (exit status 1) is mysqld stopping itself after logging an
@@ -201,7 +201,7 @@ A_FATAL_EXIT_UNDIAGNOSED_LINE=9
 # MY-code of the last [ERROR] before "Aborting". Galera and WSREP lines all
 # carry MY-000000, so for that code the key also carries the normalized
 # message, or every wsrep cause would collapse into one property.
-A_UNIREG_UNDOCUMENTED="mysqld never stops itself for an undocumented reason"
+A_UNIREG_UNDOCUMENTED="[prod] mysqld never stops itself for an undocumented reason"
 A_UNIREG_UNDOCUMENTED_LINE=10
 A_UNIREG_CAUSE_LINE=11
 
@@ -585,14 +585,14 @@ assert_failed_site() {
     case "${tier}" in
         debug_only)
             umbrella="${A_ASSERT_DEBUG_ANY}"; umbrella_line="${A_ASSERT_DEBUG_ANY_LINE}"
-            per_site="mysqld debug-only assertion failed at ${site}"; has_check=false ;;
+            per_site="[debug-only] mysqld assertion failed at ${site}"; has_check=false ;;
         release)
             umbrella="${A_ASSERT_RELEASE_ANY}"; umbrella_line="${A_ASSERT_RELEASE_ANY_LINE}"
-            per_site="mysqld release-build assertion failed at ${site}"; has_check=true ;;
+            per_site="[prod] mysqld assertion failed at ${site}"; has_check=true ;;
         *)
             tier="unknown"
             umbrella="${A_ASSERT_UNKNOWN_ANY}"; umbrella_line="${A_ASSERT_UNKNOWN_ANY_LINE}"
-            per_site="mysqld assertion of unknown build tier failed at ${site}"; has_check='"unknown"' ;;
+            per_site="[prod?] mysqld assertion failed at ${site}"; has_check='"unknown"' ;;
     esac
 
     details="$(printf '{"node":"%s","boot":%d,"site":"%s","component":"%s","function":"%s","expression":"%s","exit_status":%d,"kind":"%s","exit_cause":"%s","build_tier":"%s","release_build_has_this_check":%s,"log_line":"%s"}' \
@@ -631,7 +631,7 @@ gu_abort_death() {
         "$(json_escape "$(tail -n 5 <<< "${cause}" | cut -c1-240 | tr '\n' '|')")")"
     BUG_DEATH=1
     sdk_unreachable "${A_GU_ABORT_UNDOCUMENTED}" "${A_GU_ABORT_UNDOCUMENTED_LINE}" true "${details}"
-    sdk_unreachable "mysqld called gu_abort after $(json_escape "${key}")" "${A_GU_ABORT_CAUSE_LINE}" true "${details}"
+    sdk_unreachable "[prod] mysqld called gu_abort after $(json_escape "${key}")" "${A_GU_ABORT_CAUSE_LINE}" true "${details}"
     emit "gu_abort" "\"cause\":\"$(json_escape "${key}")\""
     return 0
 }
@@ -657,7 +657,7 @@ fatal_signal_without_assert() {
         "$(json_escape "$(grep -F '[ERROR]' <<< "${slice}" | tail -n 1 | cut -c1-300)")")"
     BUG_DEATH=1
     sdk_unreachable "${A_FATAL_SIGNAL_ANY}" "${A_FATAL_SIGNAL_ANY_LINE}" true "${details}"
-    sdk_unreachable "mysqld died on fatal signal ${sig} without a failed assertion" "${A_FATAL_SIGNAL_LINE}" true "${details}"
+    sdk_unreachable "[prod?] mysqld died on fatal signal ${sig} without a failed assertion" "${A_FATAL_SIGNAL_LINE}" true "${details}"
     emit "fatal_signal" "\"signal\":${sig}"
 }
 
@@ -718,7 +718,7 @@ unireg_abort_undocumented() {
         "$(json_escape "$(tail -n 5 <<< "${cause}" | cut -c1-240 | tr '\n' '|')")")"
     BUG_DEATH=1
     sdk_unreachable "${A_UNIREG_UNDOCUMENTED}" "${A_UNIREG_UNDOCUMENTED_LINE}" true "${details}"
-    sdk_unreachable "mysqld stopped itself after $(json_escape "${key}")" "${A_UNIREG_CAUSE_LINE}" true "${details}"
+    sdk_unreachable "[prod] mysqld stopped itself after $(json_escape "${key}")" "${A_UNIREG_CAUSE_LINE}" true "${details}"
     emit "unireg_abort_undocumented" "\"cause\":\"$(json_escape "${key}")\""
 }
 

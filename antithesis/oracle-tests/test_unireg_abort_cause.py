@@ -45,11 +45,11 @@ FUNCS = ["json_escape", "sdk_reachable", "sdk_unreachable", "sdk_declare_catalog
          "fatal_signal_without_assert", "unireg_cause_lines", "unireg_cause_key",
          "unireg_abort_undocumented", "assert_death_class"]
 
-UMBRELLA = "mysqld never stops itself for an undocumented reason"
-COVERAGE = {"a node died in a way the shipped systemd unit would not restart",
-            "a node died before mysqld reached ready for connections",
-            "a node died in a boot whose state transfer had failed",
-            "a node died after the cluster declared it inconsistent"}
+UMBRELLA = "[prod] mysqld never stops itself for an undocumented reason"
+COVERAGE = {"[coverage] a node died in a way the shipped systemd unit would not restart",
+            "[coverage] a node died before mysqld reached ready for connections",
+            "[coverage] a node died in a boot whose state transfer had failed",
+            "[coverage] a node died after the cluster declared it inconsistent"}
 
 
 def extract():
@@ -109,8 +109,8 @@ base = BOOT
 ev = run(base)
 check("pc.wait_prim_timeout stop emits no Unreachable", not unreach(ev), ev)
 check("pc.wait_prim_timeout stop emits the coverage Reachables",
-      reach(ev) == {"a node died in a way the shipped systemd unit would not restart",
-                    "a node died before mysqld reached ready for connections"}, ev)
+      reach(ev) == {"[coverage] a node died in a way the shipped systemd unit would not restart",
+                    "[coverage] a node died before mysqld reached ready for connections"}, ev)
 
 # 2. Undocumented: the same real chain without its documented line. The last
 #    ERROR before Aborting is the generic WSREP connect failure.
@@ -120,7 +120,7 @@ ev = run(no_prim)
 u = unreach(ev)
 ids = [a["id"] for a in u]
 check("gcomm connect failure without pc.wait_prim_timeout fails the umbrella", UMBRELLA in ids, ev)
-key = "mysqld stopped itself after MY-000000 [WSREP] Provider/Node (gcomm://...) failed to establish connection with cluster (reason: 7)"
+key = "[prod] mysqld stopped itself after MY-000000 [WSREP] Provider/Node (gcomm://...) failed to establish connection with cluster (reason: 7)"
 check("per-cause property is keyed on the last ERROR before Aborting, normalized", key in ids, ev)
 check("coverage Reachables are skipped for an undocumented unireg_abort", not (reach(ev) & COVERAGE), ev)
 d = next(a["details"] for a in u if a["id"] == UMBRELLA)
@@ -144,7 +144,7 @@ head = "\n".join(base.splitlines()[:2])
 ev = run(head + "\n" + "\n".join(innodb) + "\n")
 ids = [a["id"] for a in unreach(ev)]
 check("InnoDB stop is undocumented and keyed on MY-012981 [InnoDB]",
-      UMBRELLA in ids and "mysqld stopped itself after MY-012981 [InnoDB]" in ids, ev)
+      UMBRELLA in ids and "[prod] mysqld stopped itself after MY-012981 [InnoDB]" in ids, ev)
 
 # 4. The documented line appearing only AFTER Aborting (teardown) excuses nothing.
 ev = run(head + "\n" + "\n".join(innodb) + "\n"
@@ -155,7 +155,7 @@ check("a documented line after Aborting does not excuse the stop", UMBRELLA in [
 ev = run(head + "\n")
 ids = [a["id"] for a in unreach(ev)]
 check("silent exit 1 fails, keyed as having no ERROR line",
-      UMBRELLA in ids and "mysqld stopped itself after no [ERROR] line before exit" in ids, ev)
+      UMBRELLA in ids and "[prod] mysqld stopped itself after no [ERROR] line before exit" in ids, ev)
 
 # 6. Other exit kinds never reach the new check.
 ev = run(no_prim, kind="crash", status=137, signal=9, field="true")

@@ -12,7 +12,7 @@ helper_stubs.install()
 from antithesis import assertions as A
 from pxcwl import levers, db, leases, rnd
 
-PROP = "an operator-set pxc_maint_mode=MAINTENANCE is never reverted to DISABLED"
+PROP = "[prod] an operator-set pxc_maint_mode=MAINTENANCE is never reverted to DISABLED"
 
 
 class S:

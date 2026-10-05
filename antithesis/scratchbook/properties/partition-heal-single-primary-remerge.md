@@ -161,7 +161,7 @@ the ready/Synced clause must be quiesced or transfer-aware.
 
 ## Triage refinement (2026-09-24, run 5aa4afb557ee963d484ffea49f9a0ad4-63-0)
 
-- Found: "the cluster returns to three Synced nodes after fault injection stops" went red
+- Found: "[prod] the cluster returns to three Synced nodes after fault injection stops" went red
   after a total loss of the Primary Component. A `graceful_shutdown` on node1 overlapped
   dense partitions; all three nodes ended in singleton non-Primary views; node1's
   SELF-LEAVE never reached the others, and its restart discarded `gvwstate.dat` and got a
@@ -181,5 +181,5 @@ the ready/Synced clause must be quiesced or transfer-aware.
   `every acknowledged write is present` ever goes red with `operator_bootstrap` set in
   its details, check that first. Reconvergence is then asserted on the remaining budget,
   with `operator_bootstrap` and `cluster_status` in the details, and the reach claim
-  "terminal verification bootstrapped a cluster that had lost its primary component"
+  "[coverage] terminal verification bootstrapped a cluster that had lost its primary component"
   records how often the workload drives the cluster there.

@@ -61,11 +61,11 @@ GU_ABORT = START + """\
 
 SEGV = START + "2026-10-02T13:10:00Z UTC - mysqld got signal 11 ;\n"
 
-DEBUG_ANY = "mysqld never fails an assertion that only debug builds check"
-RELEASE_ANY = "mysqld never fails an assertion that release builds also check"
-UNKNOWN_ANY = "mysqld never fails an assertion of unknown build tier"
-GU_ANY = "mysqld never calls gu_abort for an undocumented reason"
-UNDIAGNOSED = "mysqld never dies on a fatal path without a diagnosable log line"
+DEBUG_ANY = "[debug-only] mysqld never fails an assertion"
+RELEASE_ANY = "[prod] mysqld never fails an assertion"
+UNKNOWN_ANY = "[prod?] mysqld never fails an assertion of unknown build tier"
+GU_ANY = "[prod] mysqld never calls gu_abort for an undocumented reason"
+UNDIAGNOSED = "[prod?] mysqld never dies on a fatal path without a diagnosable log line"
 
 
 def extract():
@@ -124,7 +124,7 @@ def det(ev, i): return next(a["details"] for a in ev if a["id"] == i)
 
 # 1. glibc assert: debug-only, by rule.
 ev = run(GLIBC)
-site = "mysqld debug-only assertion failed at wsrep-lib/src/client_state.cpp:536"
+site = "[debug-only] mysqld assertion failed at wsrep-lib/src/client_state.cpp:536"
 check("glibc assert names the debug-only tier", ids(ev) == {DEBUG_ANY, site}, ev)
 d = det(ev, site)
 check("glibc assert details: no release check", d["build_tier"] == "debug_only"
@@ -132,21 +132,21 @@ check("glibc assert details: no release check", d["build_tier"] == "debug_only"
 
 # 2. InnoDB ut_a inside #ifdef UNIV_DEBUG: debug-only, from the real table.
 ev = run(INNODB_DEBUG)
-site = "mysqld debug-only assertion failed at lock0lock.cc:5282"
+site = "[debug-only] mysqld assertion failed at lock0lock.cc:5282"
 check("InnoDB ut_a inside UNIV_DEBUG is debug-only", ids(ev) == {DEBUG_ANY, site}, ev)
 check("expression survives without the thread id",
       det(ev, site)["expression"] == "lock_get_wait(other_lock)")
 
 # 3. InnoDB ut_a outside UNIV_DEBUG: release.
 ev = run(INNODB_RELEASE)
-site = "mysqld release-build assertion failed at lock0lock.cc:336"
+site = "[prod] mysqld assertion failed at lock0lock.cc:336"
 check("InnoDB ut_a outside UNIV_DEBUG is release", ids(ev) == {RELEASE_ANY, site}, ev)
 check("release details say a release build has the check",
       det(ev, site)["release_build_has_this_check"] is True)
 
 # 4. Site not in the table: unknown, never guessed.
 ev = run(INNODB_UNKNOWN)
-site = "mysqld assertion of unknown build tier failed at nosuchfile0.cc:1"
+site = "[prod?] mysqld assertion failed at nosuchfile0.cc:1"
 check("site missing from the table is unknown", ids(ev) == {UNKNOWN_ANY, site}, ev)
 
 # 5. No table at all (image built without it): unknown, not release.
@@ -160,11 +160,11 @@ def run_no_table(slice_text):
         TIERS.name = saved
 ev = run_no_table(INNODB_DEBUG)
 check("missing table makes InnoDB sites unknown",
-      ids(ev) == {UNKNOWN_ANY, "mysqld assertion of unknown build tier failed at lock0lock.cc:5282"}, ev)
+      ids(ev) == {UNKNOWN_ANY, "[prod?] mysqld assertion failed at lock0lock.cc:5282"}, ev)
 
 # 6. gu_abort: its own class, keyed on the last ERROR before Terminated.
 ev = run(GU_ABORT)
-key = ("mysqld called gu_abort after MY-000000 [Galera] gcs/src/gcs_group.cpp:"
+key = ("[prod] mysqld called gu_abort after MY-000000 [Galera] gcs/src/gcs_group.cpp:"
        "gcs_group_handle_join_msg():N: Will never receive state. Need to abort.")
 check("gu_abort death fails the gu_abort umbrella and its cause", ids(ev) == {GU_ANY, key}, ev)
 d = det(ev, GU_ANY)
@@ -180,9 +180,9 @@ check("detection: without the class, gu_abort lands in undiagnosed", ids(ev) == 
 
 # 8. Bare SIGSEGV: unchanged names, labeled as unknown for release.
 ev = run(SEGV, kind="exit", status=2, signal=0)
-sig = "mysqld died on fatal signal 11 without a failed assertion"
+sig = "[prod?] mysqld died on fatal signal 11 without a failed assertion"
 check("SIGSEGV keeps the fatal-signal names",
-      ids(ev) == {"mysqld never dies on a fatal signal outside a failed assertion", sig}, ev)
+      ids(ev) == {"[prod?] mysqld never dies on a fatal signal outside a failed assertion", sig}, ev)
 check("SIGSEGV details label the cause", det(ev, sig)["exit_cause"] == "fatal_signal")
 
 # 9. Catalog: every umbrella declared as an unfired Unreachable.

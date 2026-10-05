@@ -37,7 +37,7 @@ os.environ["PXC_ERROR_LOG_SCAN_EVERY"] = "100000"
 from antithesis import assertions as A  # noqa: E402
 from pxcwl import config, db, journal, leases, oracles, probe  # noqa: E402
 
-PROP = "a node advertising availability for a sustained window has committed a write in that window"
+PROP = "[prod] a node advertising availability for a sustained window has committed a write in that window"
 
 results = []
 
@@ -275,7 +275,7 @@ check(
 )
 
 # The wedge watchdog shares the merged row, so it has to survive the rewrite.
-FROZEN = "cluster commit progress never freezes while every node reports Synced"
+FROZEN = "[prod] cluster commit progress never freezes while every node reports Synced"
 os.environ["PXC_WEDGE_WINDOW"] = "10"
 config.WEDGE_WINDOW_SECONDS = 10.0
 drive([probe.PROBE_OK])

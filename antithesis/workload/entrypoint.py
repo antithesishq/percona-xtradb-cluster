@@ -316,7 +316,7 @@ def main() -> int:
         ),
         "nodes": [name for name, _ in NODES],
     }
-    reachable("workload startup: 3-node cluster reached Synced", details)
+    reachable("[coverage] workload startup: 3-node cluster reached Synced", details)
     log("bootstrap property emitted")
 
     # Only now is the system genuinely ready for test commands.

@@ -26,7 +26,7 @@ from antithesis import assertions as A  # noqa: E402
 from pxcwl import config, ddl, schema  # noqa: E402
 from helper_ddl_model import JR, Catalog  # noqa: E402
 
-DROP_CLAIM = "a data-definition statement dropped an object the catalog reported present"
+DROP_CLAIM = "[coverage] a data-definition statement dropped an object the catalog reported present"
 
 results = []
 

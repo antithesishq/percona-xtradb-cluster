@@ -43,7 +43,7 @@ Details = dict[str, Any]
 
 
 def schemas_identical(ok: bool, details: Details) -> None:
-    always(ok, "replicated table definitions are identical on every Synced node", details)
+    always(ok, "[prod] replicated table definitions are identical on every Synced node", details)
 
 
 def table_set_identical(ok: bool, details: Details) -> None:
@@ -54,7 +54,7 @@ def table_set_identical(ok: bool, details: Details) -> None:
     TOI DDL across nodes -- a table present on one node and absent on another
     would score as identical.
     """
-    always(ok, "every Synced node agrees on the set of tables and indexes", details)
+    always(ok, "[prod] every Synced node agrees on the set of tables and indexes", details)
 
 
 def content_identical(ok: bool, details: Details) -> None:
@@ -65,7 +65,7 @@ def content_identical(ok: bool, details: Details) -> None:
     never triggers a vote at all. This comparison is the only detector for the
     dominant recurring bug class in this system.
     """
-    always(ok, "replicated table content is identical on every Synced node", details)
+    always(ok, "[prod] replicated table content is identical on every Synced node", details)
 
 
 def gtid_identical(ok: bool, details: Details) -> None:
@@ -74,41 +74,41 @@ def gtid_identical(ok: bool, details: Details) -> None:
     Rows and GTID sets can diverge separately, so neither check subsumes the
     other; both run in the same quiesced pass.
     """
-    always(ok, "gtid_executed is identical on every Synced node", details)
+    always(ok, "[prod] gtid_executed is identical on every Synced node", details)
 
 
 def acked_writes_present(ok: bool, details: Details) -> None:
-    always(ok, "every acknowledged write is present on every Synced node", details)
+    always(ok, "[prod] every acknowledged write is present on every Synced node", details)
 
 
 def failed_writes_absent(ok: bool, details: Details) -> None:
-    always(ok, "a cleanly failed write is absent from every Synced node", details)
+    always(ok, "[prod] a cleanly failed write is absent from every Synced node", details)
 
 
 def counter_at_least_acked(ok: bool, details: Details) -> None:
     """Lower bound. Unacknowledged increments may have landed, so only the
     acknowledged count is a floor -- asserting equality here would fire every
     time the environment dropped a request."""
-    always(ok, "counter total is at least the acknowledged increment count", details)
+    always(ok, "[prod] counter total is at least the acknowledged increment count", details)
 
 
 def counter_within_ceiling(ok: bool, details: Details) -> None:
     """Upper bound. Catches double-apply, which is what a broken IST-overlap
     gate or a replayed writeset looks like from outside."""
-    always(ok, "counter total never exceeds acknowledged plus unresolved increments", details)
+    always(ok, "[prod] counter total never exceeds acknowledged plus unresolved increments", details)
 
 
 def nopk_content_identical(ok: bool, details: Details) -> None:
     """Held as its own property so that a red on this documented PXC
     limitation cannot mask a red on the real content invariant."""
     always_or_unreachable(
-        ok, "primary-key-less table content is identical on every Synced node", details
+        ok, "[prod] primary-key-less table content is identical on every Synced node", details
     )
 
 
 def cluster_reconverged(ok: bool, details: Details) -> None:
     always(
-        ok, "the cluster returns to three Synced nodes after fault injection stops", details
+        ok, "[prod] the cluster returns to three Synced nodes after fault injection stops", details
     )
 
 
@@ -123,7 +123,7 @@ def saw_operator_bootstrap(details: Details) -> None:
     given loss should have self-healed.
     """
     reachable(
-        "terminal verification bootstrapped a cluster that had lost its primary component",
+        "[coverage] terminal verification bootstrapped a cluster that had lost its primary component",
         details,
     )
 
@@ -132,12 +132,12 @@ def single_lineage(ok: bool, details: Details) -> None:
     """Kept separate from reconvergence on purpose: split-brain and
     never-recovered are completely different bugs and must not share a
     verdict."""
-    always(ok, "all nodes share one cluster state UUID at terminal convergence", details)
+    always(ok, "[prod] all nodes share one cluster state UUID at terminal convergence", details)
 
 
 def no_unresolved_ddl(ok: bool, details: Details) -> None:
     always_or_unreachable(
-        ok, "no data-definition statement is left unresolved after reconvergence", details
+        ok, "[prod] no data-definition statement is left unresolved after reconvergence", details
     )
 
 
@@ -147,7 +147,7 @@ def terminal_comparison_ran(details: Details) -> None:
     Without it, a run in which quiesce always timed out would read as clean:
     the Always assertions would simply never have been evaluated.
     """
-    reachable("terminal verification completed a quiesced three-node comparison", details)
+    reachable("[coverage] terminal verification completed a quiesced three-node comparison", details)
 
 
 # ==========================================================================
@@ -158,7 +158,7 @@ def terminal_comparison_ran(details: Details) -> None:
 
 def recv_queue_bounded(ok: bool, details: Details) -> None:
     always(
-        ok, "a Synced node keeps its receive queue below the flow-control bound", details
+        ok, "[prod] a Synced node keeps its receive queue below the flow-control bound", details
     )
 
 
@@ -167,12 +167,12 @@ def commit_progress_not_frozen(ok: bool, details: Details) -> None:
     unreleased flow-control pause, and a wedged applier all present the same
     way from outside -- every node claims health while nothing commits."""
     always(
-        ok, "cluster commit progress never freezes while every node reports Synced", details
+        ok, "[prod] cluster commit progress never freezes while every node reports Synced", details
     )
 
 
 def single_primary_component(ok: bool, details: Details) -> None:
-    always(ok, "at most one primary component exists at any observation", details)
+    always(ok, "[prod] at most one primary component exists at any observation", details)
 
 
 def green_node_can_commit(ok: bool, details: Details) -> None:
@@ -188,21 +188,21 @@ def green_node_can_commit(ok: bool, details: Details) -> None:
     """
     always(
         ok,
-        "a node advertising availability for a sustained window has committed a write in that window",
+        "[prod] a node advertising availability for a sustained window has committed a write in that window",
         details,
     )
 
 
 def saw_flow_control(details: Details) -> None:
-    reachable("flow control was engaged by some node", details)
+    reachable("[coverage] flow control was engaged by some node", details)
 
 
 def saw_membership_churn(details: Details) -> None:
-    reachable("the cluster was observed with fewer than three members and later returned to three", details)
+    reachable("[coverage] the cluster was observed with fewer than three members and later returned to three", details)
 
 
 def saw_state_transfer(details: Details) -> None:
-    reachable("a state transfer was served to a joining node", details)
+    reachable("[coverage] a state transfer was served to a joining node", details)
 
 
 def saw_failed_state_transfer(details: Details) -> None:
@@ -218,7 +218,7 @@ def saw_failed_state_transfer(details: Details) -> None:
     Staying up after a failed SST is documented, though. The bug-shaped
     question -- does such a node commit client writes? -- is not checked yet.
     """
-    reachable("a live node's error log recorded a failed state transfer", details)
+    reachable("[coverage] a live node's error log recorded a failed state transfer", details)
 
 
 def saw_ist_fallback(details: Details) -> None:
@@ -228,7 +228,7 @@ def saw_ist_fallback(details: Details) -> None:
     outcomes. Folding them together would let the good path mask the bad one.
     """
     reachable(
-        "a failed state transfer fell back to IST instead of killing the node", details
+        "[coverage] a failed state transfer fell back to IST instead of killing the node", details
     )
 
 
@@ -242,7 +242,7 @@ def saw_inconsistency_verdict(details: Details) -> None:
     so being up is not the bug. Committing client writes would be, and that
     is not checked yet.
     """
-    reachable("a live node's error log recorded an inconsistency verdict", details)
+    reachable("[coverage] a live node's error log recorded an inconsistency verdict", details)
 
 
 # ==========================================================================
@@ -251,12 +251,12 @@ def saw_inconsistency_verdict(details: Details) -> None:
 
 
 def locking_read_outcome_legal(ok: bool, details: Details) -> None:
-    always(ok, "a locking read ends in a result set or a documented lock error", details)
+    always(ok, "[prod] a locking read ends in a result set or a documented lock error", details)
 
 
 def applier_resize_converged(ok: bool, details: Details) -> None:
     always_or_unreachable(
-        ok, "applier thread count reaches the configured setpoint after a resize", details
+        ok, "[prod] applier thread count reaches the configured setpoint after a resize", details
     )
 
 
@@ -272,14 +272,14 @@ def maint_mode_honors_intent(ok: bool, details: Details) -> None:
     """
     always_or_unreachable(
         ok,
-        "an operator-set pxc_maint_mode=MAINTENANCE is never reverted to DISABLED",
+        "[prod] an operator-set pxc_maint_mode=MAINTENANCE is never reverted to DISABLED",
         details,
     )
 
 
 def graceful_shutdown_bounded(ok: bool, details: Details) -> None:
     always_or_unreachable(
-        ok, "a graceful shutdown closes the port within the configured bound", details
+        ok, "[prod] a graceful shutdown closes the port within the configured bound", details
     )
 
 
@@ -291,42 +291,42 @@ def sync_wait_read_sees_acked_write(ok: bool, details: Details) -> None:
     node. The terminal oracle cannot substitute for this: it runs once, at the
     end, after everything has settled.
     """
-    always(ok, "a sync-wait read on another node sees an acknowledged write", details)
+    always(ok, "[prod] a sync-wait read on another node sees an acknowledged write", details)
 
 
 def saw_certification_conflict(details: Details) -> None:
-    reachable("a certification conflict returned ER 1213 to a client", details)
+    reachable("[coverage] a certification conflict returned ER 1213 to a client", details)
 
 
 def saw_skip_locked_conflict(details: Details) -> None:
     """Native InnoDB SKIP LOCKED cannot deadlock, so a 1213 here is
     specifically the BF-wait conversion path."""
-    reachable("a SKIP LOCKED statement returned ER 1213", details)
+    reachable("[coverage] a SKIP LOCKED statement returned ER 1213", details)
 
 
 def saw_not_ready_rejection(details: Details) -> None:
     """Since this workload never sets wsrep_reject_queries, a 1047 carrying the
     WSREP message implies the node was genuinely unready or non-primary."""
-    reachable("a client received ER 1047 from a node that was not ready", details)
+    reachable("[coverage] a client received ER 1047 from a node that was not ready", details)
 
 
 def saw_streaming_transaction(details: Details) -> None:
-    reachable("a streaming-replication transaction committed with fragments", details)
+    reachable("[coverage] a streaming-replication transaction committed with fragments", details)
 
 
 def saw_large_writeset(details: Details) -> None:
-    reachable("a writeset larger than four megabytes was committed", details)
+    reachable("[coverage] a writeset larger than four megabytes was committed", details)
 
 
 def saw_long_transaction(details: Details) -> None:
     """Deliberately NOT folded into the large-writeset claim: a hundred small
     witness inserts is a few kilobytes, so reusing that name would have made
     the claim untrue at one of its callsites."""
-    reachable("a transaction of at least one hundred statements committed", details)
+    reachable("[coverage] a transaction of at least one hundred statements committed", details)
 
 
 def saw_ddl_under_load(details: Details) -> None:
-    reachable("a data-definition statement completed under concurrent replicated writes", details)
+    reachable("[coverage] a data-definition statement completed under concurrent replicated writes", details)
 
 
 def saw_ddl_drop_of_live_object(details: Details) -> None:
@@ -339,7 +339,7 @@ def saw_ddl_drop_of_live_object(details: Details) -> None:
     would say so. A completed DROP is only reachable if a CREATE landed first
     and the lookup then saw it, so one claim covers both halves.
     """
-    reachable("a data-definition statement dropped an object the catalog reported present", details)
+    reachable("[coverage] a data-definition statement dropped an object the catalog reported present", details)
 
 
 def saw_unknown_outcome(details: Details) -> None:
@@ -350,7 +350,7 @@ def saw_unknown_outcome(details: Details) -> None:
     equality -- which means they were never tested under the conditions they
     exist for.
     """
-    reachable("a write outcome was unknown after a connection failure", details)
+    reachable("[coverage] a write outcome was unknown after a connection failure", details)
 
 
 # ==========================================================================
@@ -363,4 +363,4 @@ def harness_invariant_broken(details: Details) -> None:
     -- e.g. a node reports a write key this workload never minted. That is
     either a harness bug or something very strange in the SUT, and either way a
     human should look before trusting any other verdict in the run."""
-    unreachable("workload observed a write key it never minted", details)
+    unreachable("[prod] workload observed a write key it never minted", details)

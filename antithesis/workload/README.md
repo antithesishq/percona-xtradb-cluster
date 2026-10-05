@@ -230,7 +230,7 @@ Notes:
   - TODO: Find the log lines for the other levers in the source code and add
     them here.
 - **Do not use `outcome_tally` to explain a crash.** The assertion
-  "terminal verification completed a quiesced three-node comparison" carries
+  "[coverage] terminal verification completed a quiesced three-node comparison" carries
   `outcome_tally` in its details: counts of `<operation>/<errno>` for the
   whole timeline, for example `graceful_shutdown/-1: 3`. It is only a coverage
   check. It has no time, no order, and no node, it keeps only the 40 largest
@@ -241,6 +241,27 @@ Notes:
   still a PXC finding. Use `../scratchbook/triage-scope.md` to decide if
   Percona owns the code.
 
+## Property labels
+
+Every property that the harness emits starts with a label. The label answers
+one question: would a production (release) build fail this way?
+
+| Label | Answer | Examples |
+| --- | --- | --- |
+| `[prod]` | Yes. A production build has the same check, or the property checks what a client sees, which does not depend on the build type. | `[prod] gtid_executed is identical on every Synced node`, `[prod] mysqld called gu_abort after <cause>` |
+| `[debug-only]` | The check exists only in this Debug build. The bad state is probably real in production too, but production does not stop there. | `[debug-only] mysqld assertion failed at galera/src/certification.cpp:1307` |
+| `[prod?]` | The log cannot tell. | `[prod?] mysqld died on fatal signal 11 without a failed assertion` |
+| `[coverage]` | Not a bug signal. It passes when the workload drives the cluster into a state. A failing one means a coverage gap. | `[coverage] a state transfer was served to a joining node` |
+
+The rule in the code: a workload `always`, `always_or_unreachable` or
+`unreachable` assertion is `[prod]`, and a `reachable` one is `[coverage]`.
+The supervisor (`../pxc-node/entrypoint.sh`) labels each mysqld death as
+described in the next section. A new property must follow the same rule.
+
+Intentionally not labeled: the Antithesis built-in properties (for example
+"Always: Peak memory usage", "No unexpected container exits"). The platform
+names those.
+
 ## Who ended the process
 
 The findings go to the Percona team, so every mysqld death in a report must
@@ -249,7 +270,7 @@ say who ended the process. There are three kinds:
 | Kind | Meaning | Would a release build die the same way? |
 | --- | --- | --- |
 | PXC release behavior | PXC's shipped code decided to stop: `gu_abort()`, `unireg_abort`, an InnoDB `ut_a`/`ut_error` that release builds keep, a SIGSEGV. | Yes. It can be a bug or a designed response. |
-| Debug-only check | A check that exists only because this image is a Debug build: glibc `assert()` in mysqld, wsrep-lib or Galera (release builds define `NDEBUG`, see Galera's `SConstruct:92`), InnoDB `ut_ad`, or a `ut_a` inside `#ifdef UNIV_DEBUG`. | No. Release builds have no check there. The failed invariant is still Percona's own, but production would carry on, and what happens next is unknown. |
+| Debug-only check | A check that exists only because this image is a Debug build: glibc `assert()` in mysqld, wsrep-lib or Galera (release builds define `NDEBUG`, see Galera's `SConstruct:92`), InnoDB `ut_ad`, or a `ut_a` inside `#ifdef UNIV_DEBUG`. | No. Release builds have no check there. The bad state it caught comes from the same code, so production almost certainly reaches it too; it just does not stop there, and what happens next is unknown. Rarely, debug-only code (extra validation, debug sync points) creates the state itself, so check the site before you call it a production bug. |
 | Harness- or fault-forced | An Antithesis kill, stop or pause, a lever (for example SQL `SHUTDOWN`), or the supervisor kill channel. | Not a PXC decision. |
 
 The harness never turns an assertion into a crash. It builds PXC with the
@@ -262,16 +283,16 @@ How the supervisor names each kind:
 
 | Property | Kind | `exit_cause` in the details |
 | --- | --- | --- |
-| `mysqld debug-only assertion failed at <site>` | Debug-only check | `debug_only_assert` |
-| `mysqld release-build assertion failed at <site>` | PXC release behavior | `release_assert` |
-| `mysqld assertion of unknown build tier failed at <site>` | Unknown: check the source line | `unknown_assert` |
-| `mysqld called gu_abort after <cause>` | PXC release behavior | `gu_abort` |
-| `mysqld stopped itself after <cause>` | PXC release behavior (`unireg_abort`) | `unireg_abort` |
-| `mysqld died on fatal signal <N> without a failed assertion` | Probably PXC release behavior; a Debug build can crash where a release build does not | `fatal_signal` |
-| `mysqld never dies on a fatal path without a diagnosable log line` | Unknown: read the log | `undiagnosed` |
+| `[debug-only] mysqld assertion failed at <site>` | Debug-only check | `debug_only_assert` |
+| `[prod] mysqld assertion failed at <site>` | PXC release behavior | `release_assert` |
+| `[prod?] mysqld assertion failed at <site>` | Unknown: check the source line | `unknown_assert` |
+| `[prod] mysqld called gu_abort after <cause>` | PXC release behavior | `gu_abort` |
+| `[prod] mysqld stopped itself after <cause>` | PXC release behavior (`unireg_abort`) | `unireg_abort` |
+| `[prod?] mysqld died on fatal signal <N> without a failed assertion` | Probably PXC release behavior; a Debug build can crash where a release build does not | `fatal_signal` |
+| `[prod?] mysqld never dies on a fatal path without a diagnosable log line` | Unknown: read the log | `undiagnosed` |
 
-Each of these also has an umbrella property (for example `mysqld never fails
-an assertion that only debug builds check`), and the details carry
+Each of these also has an umbrella property (for example `[debug-only] mysqld
+never fails an assertion`), and the details carry
 `release_build_has_this_check` (`true`, `false` or `"unknown"`).
 
 For an InnoDB `Assertion failure`, the build stage `assert-tiers` runs
