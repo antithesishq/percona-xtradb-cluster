@@ -210,3 +210,28 @@ implies unready/non-primary (`pxc_maint_mode` never produces 1047).
 - Conclusion: RESOLVED. Checker rule: workload never sets `wsrep_reject_queries` ⇒ any
   1047 with the WSREP message implies unready/non-primary. SHOW STATUS/VARIABLES bypass
   both gates for post-hoc confirmation.
+
+#### ROLLBACK is rejected too, and the workload must not leak the transaction (2026-10-05)
+
+- Examined: `sql/sql_parse.cc:3790-3807` (the readiness gate in `mysql_execute_command`),
+  `mysql-test/suite/galera_3nodes_sr/t/GCF-336.test`, PyMySQL 1.4.6 `Connection.rollback`.
+- Found: the gate lets through only SET, SHOW, table-less SELECT and dirty reads, so
+  `ROLLBACK` (sent by PyMySQL as a plain `COM_QUERY`) fails with 1047 on a non-Primary node
+  and the transaction stays open. GCF-336 expects the same 1047 for `COMMIT`, so the gate
+  is intended. Once the node is Primary again, the next `BEGIN` on that session commits
+  the open transaction (MySQL implicit commit).
+- Consequence for the workload: the old `ops._rollback_quietly` swallowed the 1047, and
+  `classify` called the write FAILED. Runs 7a6819d0-63-2 and a52c84b4-63-5 fired
+  "[prod] a cleanly failed write is absent from every Synced node" that way. A leaked
+  transaction also absorbs later autocommit writes, which return OK and are lost at the
+  next successful rollback: the probable cause of the counter-floor failures in
+  a52c84b4-63-5 (not proven from the log).
+- Fix: `ops._rollback_or_close` closes the connection when `ROLLBACK` fails. The server
+  discards an uncommitted transaction on disconnect, and a closed client cannot commit
+  it, so FAILED stays true. `_finish` classifies before it rolls back, because the
+  rollback may close the connection that `classify` probes.
+- Coverage: `[coverage] a non-Primary node rejected ROLLBACK of an open transaction`
+  fires when a live node rejects `ROLLBACK` with 1047 while `SERVER_STATUS_IN_TRANS` was
+  set. Detection test: `oracle-tests/test_rollback_rejected.py`.
+- For Percona (design question, not a data bug): `ROLLBACK` needs nothing from the
+  cluster, but the gate rejects it and leaves the transaction and its locks open.

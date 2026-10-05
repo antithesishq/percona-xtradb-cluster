@@ -310,6 +310,20 @@ def saw_not_ready_rejection(details: Details) -> None:
     reachable("[coverage] a client received ER 1047 from a node that was not ready", details)
 
 
+def saw_rollback_rejected(details: Details) -> None:
+    """A live, non-Primary node refused ROLLBACK of an open transaction.
+
+    Intended PXC behavior, not a finding: ROLLBACK goes through the same
+    readiness gate as COMMIT (sql/sql_parse.cc:3790; upstream test
+    galera_3nodes_sr/GCF-336 expects ER 1047 for COMMIT on an isolated node).
+    The workload discards such a transaction by closing the connection
+    (ops._rollback_or_close). This claim proves that path runs: without it,
+    the "cleanly failed write is absent" and counter-floor checks would go
+    green whether or not the case was ever exercised.
+    """
+    reachable("[coverage] a non-Primary node rejected ROLLBACK of an open transaction", details)
+
+
 def saw_streaming_transaction(details: Details) -> None:
     reachable("[coverage] a streaming-replication transaction committed with fragments", details)
 

@@ -86,22 +86,51 @@ class Session:
         self.conn = None
 
 
-def _rollback_quietly(conn) -> None:
-    """Discard any open transaction.
+def _rollback_or_close(conn, shape: str) -> None:
+    """Discard any open transaction, closing the connection if ROLLBACK fails.
 
     Load-bearing, not hygiene. MySQL rolls back only the failing STATEMENT on a
     lock-wait timeout or certification conflict; the transaction stays open. A
     subsequent BEGIN or any DDL on that session implicitly commits whatever had
     already landed -- so a write the journal called FAILED would actually be
-    there, and the no-trace assertion would fire on a correct cluster. Rolling
-    back here is what makes the FAILED classification true.
+    there, and the no-trace assertion would fire on a correct cluster.
+    Discarding the transaction here is what makes the FAILED classification
+    true.
+
+    ROLLBACK itself can fail on a live connection. A non-Primary node rejects
+    it with ER 1047, because the wsrep readiness gate in mysql_execute_command
+    lets through only SET, SHOW and table-less SELECT (sql/sql_parse.cc:3790).
+    The transaction then stays open, and once the node is Primary again the
+    next BEGIN on this session commits it. That is what fired "a cleanly
+    failed write is absent" in run a52c84b4-63-5 (txn_witness, errno 1047,
+    node1) and 7a6819d0-63-2. A leaked transaction also swallows later
+    autocommit writes: they return OK inside it, and a later rollback discards
+    them, which is the probable cause of the missing acknowledged increments
+    in a52c84b4-63-5.
+
+    So when ROLLBACK fails, the connection is closed. The server discards an
+    uncommitted transaction when its client disconnects, and a closed client
+    can never send the COMMIT, so the transaction can no longer land and the
+    FAILED claim holds. Session.ensure() reconnects on the next operation.
     """
     if conn is None:
         return
+    # SERVER_STATUS_IN_TRANS from the last OK packet: whether a transaction was
+    # open before the error. The error packet carries no status, so this is
+    # the state the failing statement ran in.
+    in_transaction = bool((getattr(conn, "server_status", None) or 0) & db.SERVER_STATUS_IN_TRANS)
     try:
         conn.rollback()
-    except Exception:  # noqa: BLE001 - a dead connection needs no rollback
-        pass
+        return
+    except Exception as e:  # noqa: BLE001 - every failure ends the same way
+        errno = db.errno_of(e)
+        error = str(e)[:200]
+    db.close_quietly(conn)
+    # A dead connection also fails ROLLBACK, and needs no evidence. The reach
+    # claim is only for the case above: a live node refusing to roll back an
+    # open transaction.
+    if in_transaction and errno == db.ER_UNKNOWN_COM_ERROR:
+        oracles.saw_rollback_rejected({"shape": shape, "host": conn.host, "error": error})
 
 
 def _finish(jr, wids: list[int], shape: str, exc, conn, *, at_commit: bool) -> str:
@@ -111,10 +140,13 @@ def _finish(jr, wids: list[int], shape: str, exc, conn, *, at_commit: bool) -> s
     committing statement decides whether a 1105/1205/1317 proves no trace (see
     db.COMMIT_AMBIGUOUS), so every callsite has to say which it is. An
     autocommit write passes True -- the statement is the commit.
+
+    Classify before the rollback: classify probes the connection to tell a
+    clean rejection from a lost one, and _rollback_or_close may close it.
     """
-    if exc is not None:
-        _rollback_quietly(conn)
     state, errno, msg = journal.classify(exc, conn, at_commit=at_commit)
+    if exc is not None:
+        _rollback_or_close(conn, shape)
     jr.resolve(wids, state, errno=errno, errmsg=msg)
     jr.tally(shape, errno)
 
@@ -289,9 +321,10 @@ def update_hot_row(jr, s: Session, profile: dict) -> None:
             cur.execute("UPDATE `wl_hot` SET v = v + 1 WHERE hid = %s", (hid,))
     except Exception as e:  # noqa: BLE001
         exc = e
-    if exc is not None:
-        _rollback_quietly(s.conn)
+    # Classify first: _rollback_or_close may close the connection it probes.
     state, errno, msg = journal.classify(exc, s.conn, at_commit=True)
+    if exc is not None:
+        _rollback_or_close(s.conn, "update_hot_row")
     jr.resolve_incrs([incr_id], state)
     jr.tally("update_hot_row", errno)
     if errno == db.ER_LOCK_DEADLOCK:
@@ -374,17 +407,16 @@ def locking_read(jr, s: Session, profile: dict) -> None:
         s.conn.commit()
     except Exception as e:  # noqa: BLE001
         exc = e
-        try:
-            s.conn.rollback()
-        except Exception:  # noqa: BLE001
-            pass
 
     errno = db.errno_of(exc) if exc is not None else None
     jr.tally(f"locking_read{'' if not modifier else ':' + modifier.split()[-1]}", errno)
 
     # Only judge the statement when the server answered and is still alive. A
     # connection lost to an injected fault says nothing about this property.
+    # Probed before the rollback, which may close the connection.
     alive = db.is_alive(s.conn)
+    if exc is not None:
+        _rollback_or_close(s.conn, "locking_read")
     if exc is None or errno in db.LOCKING_READ_LEGAL or errno in db.CLEAN_REJECTIONS:
         legal = True
     elif not alive or errno in (db.CR_SERVER_GONE_ERROR, db.CR_SERVER_LOST):
@@ -439,7 +471,7 @@ def fk_cascade_dml(jr, s: Session, profile: dict) -> None:
                     )
                     jr.tally("fk_cascade_delete", None)
         except Exception as e:  # noqa: BLE001
-            _rollback_quietly(s.conn)
+            _rollback_or_close(s.conn, "fk_cascade_dml")
             jr.tally("fk_cascade_dml", db.errno_of(e))
         return
 

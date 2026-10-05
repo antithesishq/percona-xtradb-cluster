@@ -35,6 +35,12 @@ ER_UNKNOWN_ERROR = 1105
 ER_OPTION_PREVENTS_STATEMENT = 1290
 ER_CANT_EXECUTE_IN_READ_ONLY = 1836
 
+# Server status bit from the MySQL protocol (SERVER_STATUS_IN_TRANS in
+# include/mysql_com.h): set in an OK packet while a transaction is open.
+# Defined here rather than imported from pymysql.constants so the oracle tests'
+# pymysql stub does not need to grow a constants module.
+SERVER_STATUS_IN_TRANS = 0x0001
+
 CLEAN_REJECTIONS: frozenset[int] = frozenset(
     {
         ER_LOCK_DEADLOCK,
