@@ -16,6 +16,10 @@ in triage rather than reported as a PXC bug.
 This file is the ownership map. Apply it to every crash site, every stack frame,
 and every oracle failure before ranking findings.
 
+After you decide ownership, put each Percona finding in one theme from
+`property-themes.md` (T1 to T9). Group the triage report by theme, so the
+findings can go to Percona as they are.
+
 ## Percona-owned (report these)
 
 | Path in the build (`/src/...`) | Repo location | What it is |
