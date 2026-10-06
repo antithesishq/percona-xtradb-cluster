@@ -19,6 +19,26 @@ import traceback
 from . import checks, config, db, journal, leases, oracles
 
 
+# A node that has no cluster state reports the all-zero UUID: Galera resets
+# the local state UUID when the node declares itself Inconsistent or before a
+# joiner receives a state. That is "no lineage", not a second lineage. Counting
+# it made single_lineage fail in run fdb9d32c...-63-5 (vtime 687), where node2
+# was Inconsistent and node1/node3 shared the real cluster UUID. The node is
+# still reported by cluster_reconverged (not Synced), and its raw UUID stays
+# in the details as per_node_state_uuid. Any non-zero UUID that differs is
+# still a fork, whether or not that node is Synced.
+ZERO_UUID = "00000000-0000-0000-0000-000000000000"
+
+
+def _lineage_of(state: dict | None) -> str:
+    uuid = (state or {}).get("wsrep_local_state_uuid") or ""
+    return "" if uuid == ZERO_UUID else uuid
+
+
+def _lineages(states: dict) -> list[str]:
+    return sorted({u for u in (_lineage_of(s) for s in states.values()) if u})
+
+
 def run(mode: str) -> int:
     """Entry point. Never exits non-zero for an environment condition.
 
@@ -64,13 +84,7 @@ def _run(mode: str) -> int:
 
         synced = {n: db.is_synced(s) for n, s in states.items()}
         all_synced = _all_synced(states)
-        uuids = sorted(
-            {
-                s.get("wsrep_local_state_uuid", "")
-                for s in states.values()
-                if s and s.get("wsrep_local_state_uuid")
-            }
-        )
+        uuids = _lineages(states)
 
         base = {
             "mode": mode,
@@ -87,6 +101,9 @@ def _run(mode: str) -> int:
             },
             "unreachable_reasons": dict(db.LAST_ERROR),
             "state_uuids": uuids,
+            "per_node_state_uuid": {
+                n: (s or {}).get("wsrep_local_state_uuid") for n, s in states.items()
+            },
             "operator_bootstrap": bootstrap,
         }
 
@@ -99,9 +116,7 @@ def _run(mode: str) -> int:
         #
         # Gated on at least two nodes actually reporting a lineage: a single
         # reachable node cannot evidence a fork either way.
-        reporting = [
-            s for s in states.values() if s and s.get("wsrep_local_state_uuid")
-        ]
+        reporting = [s for s in states.values() if _lineage_of(s)]
         if len(reporting) >= 2:
             oracles.single_lineage(len(uuids) <= 1, base)
 

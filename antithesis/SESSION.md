@@ -32,7 +32,6 @@ Deferred issues found during triage. Fix later unless they block work.
 - The availability oracle cannot separate a stuck node from probes that wait on the shared `wl_probe` row lock. On timeout, add the send queue, the probe processlist state and InnoDB lock waits.
 - The reconvergence wait logs nothing for about 600 s. Sample `wsrep_local_state_comment` per node periodically.
 - `snouty runs events` returned HTTP 500 for every property tried in this run. Parallel `snouty runs logs` downloads got HTTP 429. Pass `--` before a negative input hash. `--begin-vtime` must come before the positional arguments.
-- **`single_lineage` counts the zero UUID of an Inconsistent node** (`workload/pxcwl/verify.py:106`). Compare only Synced nodes, or drop `00000000-…`.
 - **Terminal verification cannot recover when no node accepts SQL.** `checks.bootstrap_if_no_primary` (`workload/pxcwl/checks.py:146-148`) needs a live SQL node. When all nodes loop on `pc.wait_prim_timeout`, the reconvergence check fails without an operator bootstrap.
 - **The single-primary oracle mixes lagging fields from nodes polled at different times** (`workload/pxcwl/probe.py:285-320`). Record `wsrep_local_state`, `wsrep_cluster_conf_id` and `wsrep_cluster_state_uuid` per node.
 - **The availability oracle has no server-side evidence when a probe write times out.** Capture `innodb_trx`, `metadata_locks` and the processlist on a 2013 timeout.
