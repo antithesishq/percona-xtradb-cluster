@@ -11,8 +11,10 @@
 #   1. Generate the per-node config fragment from the environment.
 #   2. First boot: initialize the datadir. On the bootstrap node only, and only
 #      once, start with --wsrep-new-cluster.
-#   3. Every other boot: run the --wsrep-recover dance and start at the
-#      recovered position.
+#   3. Every other boot: start at the grastate.dat position after a clean
+#      shutdown, else run the --wsrep-recover dance and start at the
+#      recovered position. After an interrupted SST, empty the datadir and
+#      initialize again, as the RPM wrapper does.
 #   4. Restart mysqld when it exits, unless held down or shutting down.
 #   5. Serve the workload -> supervisor kill channel (steerable kill -9).
 #   6. Emit JSONL: boot-phase markers, the grastate/recovery probe, and restart
@@ -299,6 +301,33 @@ EOF
 # ---------------------------------------------------------------------------
 datadir_initialized() { [[ -d "${DATADIR}/mysql" ]]; }
 
+# An xtrabackup joiner wipes the datadir, including mysql/, but keeps the files
+# that match its keep-list (sst_in_progress, grastate.dat, gvwstate.dat, *.log,
+# ...; scripts/wsrep_sst_xtrabackup-v2.sh:836). If the SST is interrupted, the
+# next container start finds no mysql/ and a datadir that is not empty, and
+# --initialize refuses it with MY-010457. Before this, the supervisor then
+# exited 1 and the node stayed down for the rest of the history (run
+# fdb9d32c...-63-5, "container: pxc-nodeN, exit code: 1").
+#
+# This copies what the shipped RPM wrapper does in start-pre
+# (build-ps/rpm/mysql-systemd:57-64): with no mysql/ and an sst_in_progress
+# marker, empty the datadir and initialize again. The node then joins as a
+# fresh joiner and requests a full SST, as it would in the field.
+#
+# TODO: the RPM wrapper runs this on every service start. The supervisor runs
+# it only at container start; a mysqld restart inside the supervisor loop still
+# starts on the partial datadir and lets mysqld request SST itself (the Debian
+# wrapper's behavior, build-ps/debian/extra/mysql-helpers:189). Decide whether
+# the in-loop restart should follow the RPM rule too.
+clear_interrupted_sst() {
+    [[ -f "${DATADIR}/sst_in_progress" ]] || return 0
+    emit "sst_leftover_cleared"
+    log "datadir has no mysql/ and an sst_in_progress marker: an SST was interrupted; emptying ${DATADIR}"
+    # Same glob as the RPM wrapper: dotfiles survive, and none of the SST
+    # keep-list files is a dotfile.
+    rm -rf "${DATADIR:?}"/*
+}
+
 initialize_datadir() {
     emit "initialize_start"
     log "initializing datadir at ${DATADIR}"
@@ -363,6 +392,34 @@ recover_position() {
     local recover_log="${STATE_DIR}/wsrep-recover.log"
     local recover_stdio="${STATE_DIR}/wsrep-recover.stdio"
     RECOVERED_POSITION=""
+
+    # A clean shutdown leaves a real seqno in grastate.dat. Every Percona
+    # wrapper then skips --wsrep-recover and starts at uuid:seqno from that
+    # file (scripts/mysqld_safe.sh:270-276, build-ps/rpm/mysql-systemd:274-284,
+    # build-ps/debian/extra/mysql-helpers via mysql-systemd:291-309). Only an
+    # unclean stop (seqno -1) or a missing file falls through to recovery.
+    #
+    # The two positions can disagree. In run fdb9d32c...-63-5 node1 stopped
+    # cleanly with grastate seqno 604 while --wsrep-recover reported 603. The
+    # supervisor used 603, IST re-applied 604 on top of data that already held
+    # it, and every boot died in the 1062 cleanup path
+    # (wsrep-lib/src/server_state.cpp:1372). The field would have started at
+    # 604, so that crash loop was the harness's own.
+    #
+    # Intentionally not copied: the upstream scripts/systemd/mysqld_pre_systemd
+    # always runs recovery, but PXC packages ship the build-ps wrappers.
+    local gs_uuid gs_seqno
+    if [[ -f "${DATADIR}/grastate.dat" ]]; then
+        gs_uuid=$(awk -F': *' '/^uuid:/  {print $2}' "${DATADIR}/grastate.dat" | tr -d '[:space:]')
+        gs_seqno=$(awk -F': *' '/^seqno:/ {print $2}' "${DATADIR}/grastate.dat" | tr -d '[:space:]')
+        if [[ -n "${gs_uuid}" && "${gs_seqno}" =~ ^[0-9]+$ ]]; then
+            RECOVERED_POSITION="${gs_uuid}:${gs_seqno}"
+            emit "recover_done" "\"rc\":0,\"position\":\"${RECOVERED_POSITION}\",\"source\":\"grastate\""
+            log "grastate.dat has seqno ${gs_seqno}; skipping --wsrep-recover, as the shipped wrappers do"
+            return 0
+        fi
+    fi
+
     : > "${recover_log}"
     : > "${recover_stdio}"
     # Hand the log to mysql, for the same reason LOG_ERROR is chowned below.
@@ -406,7 +463,7 @@ recover_position() {
     fi
 
     RECOVERED_POSITION="${pos}"
-    emit "recover_done" "\"rc\":${rc},\"position\":\"${pos}\""
+    emit "recover_done" "\"rc\":${rc},\"position\":\"${pos}\",\"source\":\"wsrep-recover\""
     log "recovered position: ${pos}"
 }
 
@@ -873,6 +930,7 @@ write_node_cnf
 
 INIT_FILE_ARG=()
 if ! datadir_initialized; then
+    clear_interrupted_sst
     initialize_datadir
     if [[ "${PXC_BOOTSTRAP}" == "1" ]]; then
         INIT_FILE_ARG=(--init-file="$(write_init_file)")

@@ -13,3 +13,26 @@ Deferred issues found during triage. Fix later unless they block work.
 - `antithesis/scratchbook/properties/first-committer-wins-loser-leaves-no-trace.md:92-93,117` says CONN_FAIL is returned only before ordering. Run 17eb4031…-63-5 disproves it: a node that goes non-Primary after send gets CONN_FAIL for a writeset the rest of the cluster orders.
 - The "write outcome unknown" coverage events carry no node, so triage cannot assign them to a node. Add `node` to their details.
 - `snouty runs events` for the gtid property returned only passing examples in run 17eb4031…-63-5, so other counterexamples cannot be sampled without query-logs.
+
+## From run fdb9d32c8a35933b692e455477bb0e9f-63-5 (2026-10-06)
+
+- **InnoDB wsrep XID can lag the committed data.** In run fdb9d32c…-63-5, node2 restarted after a kill (grastate seqno -1), recovered position 1276, and IST re-applied a `wl_witness` row it already had (1062, then `sql/transaction_info.h:472`, vtime 110-120). The grastate fix does not cover this path. Candidate for T7 `grastate-se-checkpoint-agreement`.
+- `snouty runs events` timed out (120 s) for the primary-component property, so it could not sample more counterexamples.
+
+## From run 69449aa58ca0c6eb951ad94a09d897a2-63-5 (12h, images @ d902550b0, 2026-10-06)
+
+- **Split-brain false positive.** `single_primary_component` (`workload/pxcwl/probe.py:282-322`) reads the nodes in sequence and records no time per sample. One 5 s connect timeout to a down node let two non-overlapping one-member views look like two Primaries (vtime 212.50). Add `sampled_at` per node, and compare only samples within a short window. Skip nodes in `pxc_maint_mode=SHUTDOWN`.
+- **Stale socket lock deaths are in this run.** The images predate `86e244a08`. Do not count `MY-010119 [Server]` / `MY-010268 [Server]` deaths, or the `View callback failed` deaths that follow MY-010259.
+- **gu_abort property names keep the node UUID.** "failed to close gcomm backend connection: element X not found" splits one cause into 5 properties. Normalize the UUID.
+- **Crash dumps arrive late or get lost.** `tail -F` (`entrypoint.sh:907`) copies the error log with a delay. The dump lands after the counterexample moment, and it is lost if the container stops at once (signal 6 deaths had no frames). Fetch with `snouty runs logs` and no vtime to stream to the end of the branch, or flush the error log before the supervisor exits.
+- **DDL lever does not log its outcome.** `_run_ddl` (`workload/pxcwl/ddl.py`) emits no statement text or result. The `wl_scratch_ephemeral` schema mismatch cannot be decided. Emit a `pxc_ddl` event with statement, node, outcome and errno.
+- `compare_table_set` (`checks.py:361`) reads `information_schema` without `wsrep_sync_wait`. Add each node's `wsrep_last_committed` and in-flight TOI processlist to the details.
+- The sync-wait oracle does not record the reader's `wsrep_local_state`. A read on a JOINED node looks like a read on a Synced node.
+- Workload ops do not log the SR fragment size, connection id or server trx id. Triage cannot map a `wid` to a Galera trx.
+- The availability oracle cannot separate a stuck node from probes that wait on the shared `wl_probe` row lock. On timeout, add the send queue, the probe processlist state and InnoDB lock waits.
+- The reconvergence wait logs nothing for about 600 s. Sample `wsrep_local_state_comment` per node periodically.
+- `snouty runs events` returned HTTP 500 for every property tried in this run. Parallel `snouty runs logs` downloads got HTTP 429. Pass `--` before a negative input hash. `--begin-vtime` must come before the positional arguments.
+- **`single_lineage` counts the zero UUID of an Inconsistent node** (`workload/pxcwl/verify.py:106`). Compare only Synced nodes, or drop `00000000-…`.
+- **Terminal verification cannot recover when no node accepts SQL.** `checks.bootstrap_if_no_primary` (`workload/pxcwl/checks.py:146-148`) needs a live SQL node. When all nodes loop on `pc.wait_prim_timeout`, the reconvergence check fails without an operator bootstrap.
+- **The single-primary oracle mixes lagging fields from nodes polled at different times** (`workload/pxcwl/probe.py:285-320`). Record `wsrep_local_state`, `wsrep_cluster_conf_id` and `wsrep_cluster_state_uuid` per node.
+- **The availability oracle has no server-side evidence when a probe write times out.** Capture `innodb_trx`, `metadata_locks` and the processlist on a 2013 timeout.
