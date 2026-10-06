@@ -14,6 +14,7 @@ property entirely passes the first half and fails the second.
   5. Session.ensure stopped at the first rejected SET.
 """
 import sqlite3
+import time
 import sys, pathlib
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import helper_stubs
@@ -205,6 +206,10 @@ print("\n--- operator bootstrap on total loss of Primary")
 REFUSED = "OperationalError: (2003, \"Can't connect to MySQL server on '10.20.20.11' ([Errno 111] Connection refused)\")"
 TIMEOUT = "OperationalError: (2003, \"Can't connect to MySQL server on '10.20.20.11' (timed out)\")"
 H1 = dict(config.NODES)["node1"]
+# The retry loop runs on wall time; with sleep stubbed out, a short budget and
+# no resend gap keep the never-takes-effect case to a fraction of a second.
+checks.BOOTSTRAP_RETRY_SECONDS = 0.2
+checks.BOOTSTRAP_RESEND_SECONDS = 0.0
 
 
 def nonprim(lc):
@@ -222,12 +227,17 @@ def ledger(**high):
     return type("LJ", (), {"conn": c})()
 
 
-def run_bootstrap(samples, n1_error, jr=None):
+def run_bootstrap(samples, n1_error, jr=None, after_send=None, takes_effect_on=1):
+    """``after_send`` is what every node reports once the ``takes_effect_on``-th
+    pc.bootstrap has been sent; before that, ``samples`` plays out as usual.
+    With no ``after_send`` the SET never takes effect, as when Galera ignores it."""
     seq = list(samples)
     calls = {"n": 0}
     sent = []
 
     def cluster_status():
+        if after_send is not None and len(sent) >= takes_effect_on:
+            return after_send
         i = min(calls["n"], len(seq) - 1)
         calls["n"] += 1
         return seq[i]
@@ -246,7 +256,7 @@ def run_bootstrap(samples, n1_error, jr=None):
     db.connect_with_retry = lambda host, *a, **k: BConn()
     checks.time.sleep = lambda s: None
     jr = jr or ledger(node1=690, node2=700, node3=704)
-    return checks.bootstrap_if_no_primary(jr), sent
+    return checks.bootstrap_if_no_primary(jr, time.time() + 300), sent
 
 
 def did(r, sent):
@@ -256,13 +266,34 @@ def did(r, sent):
 # The 5aa4afb5 end state: node1 between boots and counted in the others'
 # 3-member non-Primary component; node2/node3 non-Primary.
 LOST = {"node1": None, "node2": nonprim(700), "node3": nonprim(704)}
-r, sent = run_bootstrap([LOST, LOST, LOST], REFUSED)
+# What a bootstrap of node3 looks like once Galera acts on it.
+BOOTED3 = {"node1": None, "node2": {**nonprim(704), "wsrep_cluster_status": "Primary"},
+           "node3": {**nonprim(704), "wsrep_cluster_status": "Primary"}}
+r, sent = run_bootstrap([LOST, LOST, LOST], REFUSED, after_send=BOOTED3)
 check("no Primary anywhere, node1 refused -> bootstraps the most advanced node (node3)",
       did(r, sent) and r["node"] == "node3", f"{r and r['node']} {sent}")
 
 DNS = "OperationalError: (2003, \"Can't connect to MySQL server on 'pxc-node1' ([Errno -2] Name or service not known)\")"
-r, sent = run_bootstrap([LOST, LOST, LOST], DNS)
+r, sent = run_bootstrap([LOST, LOST, LOST], DNS, after_send=BOOTED3)
 check("node1 container gone (DNS failure) -> treated as down, bootstraps", did(r, sent))
+
+# The 1ef68127-63-5 red: Galera logs "ignoring 'pc.bootstrap' in state
+# STATES_EXCH" yet the SET returns OK. The first send must not count; the
+# second, landing in S_NON_PRIM, does.
+r, sent = run_bootstrap([LOST, LOST, LOST], REFUSED, after_send=BOOTED3, takes_effect_on=2)
+check("first pc.bootstrap ignored -> resent, bootstrapped only once node3 is Primary",
+      did(r, sent) and r["sends"] == 2 and len(sent) == 2, f"{r and r.get('sends')} {sent}")
+
+r, sent = run_bootstrap([LOST, LOST, LOST], REFUSED)
+check("pc.bootstrap never takes effect -> reported as NOT bootstrapped",
+      bool(r) and not r["bootstrapped"] and len(sent) >= 1
+      and "no Primary on node3" in (r["error"] or ""), str(r and r["error"]))
+
+ELSEWHERE = {"node1": None, "node2": {**nonprim(700), "wsrep_cluster_status": "Primary"},
+             "node3": nonprim(704)}
+r, sent = run_bootstrap([LOST, LOST, LOST], REFUSED, after_send=ELSEWHERE)
+check("after the send a Primary forms without the chosen node -> NOT bootstrapped",
+      bool(r) and not r["bootstrapped"] and "not node3" in (r["error"] or ""), str(r and r["error"]))
 
 with_prim = {**LOST, "node2": {**nonprim(700), "wsrep_cluster_status": "Primary"}}
 r, sent = run_bootstrap([with_prim, with_prim], REFUSED)

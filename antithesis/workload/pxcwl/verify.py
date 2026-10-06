@@ -57,7 +57,7 @@ def _run(mode: str) -> int:
         states = checks.wait_all_synced(started + config.VERIFY_BUDGET_SECONDS * 0.4)
         bootstrap = None
         if not _all_synced(states):
-            bootstrap = checks.bootstrap_if_no_primary(jr)
+            bootstrap = checks.bootstrap_if_no_primary(jr, deadline)
             if bootstrap is not None and bootstrap["bootstrapped"]:
                 oracles.saw_operator_bootstrap({"mode": mode, **bootstrap})
             states = checks.wait_all_synced(deadline)

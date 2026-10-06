@@ -111,7 +111,7 @@ def _ledger_high_water(jr) -> tuple[int | None, dict[str, int]]:
     return (max(seen.values()) if seen else -1), seen
 
 
-def bootstrap_if_no_primary(jr, stable_for: float = 15.0) -> dict | None:
+def bootstrap_if_no_primary(jr, deadline: float, stable_for: float = 15.0) -> dict | None:
     """Recover a cluster that has lost its Primary Component, as an operator would.
 
     Galera does not recover from this on its own unless every member of the
@@ -136,6 +136,9 @@ def bootstrap_if_no_primary(jr, stable_for: float = 15.0) -> dict | None:
         lineage, so a down node that was once seen further ahead blocks the
         bootstrap outright. With no ledger at all, only a fully reachable
         cluster -- where the comparison below is the whole truth -- qualifies.
+
+    ``bootstrapped`` is true only when the chosen node reports Primary after a
+    send, never merely because the SET returned. Sends stop at ``deadline``.
 
     Runs only after fault injection has stopped. Returns None when not
     applicable, else what was decided and done.
@@ -184,25 +187,81 @@ def bootstrap_if_no_primary(jr, stable_for: float = 15.0) -> dict | None:
         decision["error"] = "a node was once observed ahead of every reachable node"
         return decision
 
+    # A successful SET is not a bootstrap. Galera acts on pc.bootstrap only
+    # while the node's PC protocol is in S_NON_PRIM; in any other state, such
+    # as STATES_EXCH during a membership change, it logs "ignoring
+    # 'pc.bootstrap' in state ..." and the SET still returns OK
+    # (gcomm/src/pc_proto.cpp:1728-1734). A node stuck in a
+    # pc.wait_prim_timeout restart loop drags the others through state
+    # exchange on every boot, so a single SET can land in that window and do
+    # nothing: run 1ef68127-63-5 stayed non-Primary for 345 s after a
+    # "bootstrapped" verdict. So the SET is repeated, under the same gates,
+    # until the chosen node itself reports Primary or the budget runs out.
     host = dict(config.NODES)[chosen]
+    give_up = min(deadline, time.time() + BOOTSTRAP_RETRY_SECONDS)
+    sends = 0
+    next_send = 0.0
+    send_errors: list[str] = []
+    while True:
+        states = db.cluster_status()
+        primary_on = [n for n, st in states.items() if _is_primary(st)]
+        if primary_on:
+            if sends and chosen in primary_on:
+                decision["bootstrapped"] = True
+            elif sends:
+                decision["error"] = f"after pc.bootstrap, Primary appeared on {primary_on} not {chosen}"
+            else:
+                # Last look: the sampling above took seconds, and a booting
+                # node can restore a Primary in that gap.
+                decision["error"] = "a Primary appeared before the bootstrap was sent"
+            break
+        if time.time() >= give_up:
+            decision["error"] = (
+                f"no Primary on {chosen} after {sends} pc.bootstrap send(s)"
+                + (f"; last send error: {send_errors[-1]}" if send_errors else "")
+            )
+            break
+        # The gate can drop out briefly while a restarting node is mid-join
+        # (cluster size below three). That is a reason to wait, not to give
+        # up: the gate holds again once the join settles.
+        if time.time() >= next_send and _no_primary_anywhere(states):
+            err = _send_pc_bootstrap(host)
+            sends += 1
+            if err:
+                send_errors.append(err)
+            next_send = time.time() + BOOTSTRAP_RESEND_SECONDS
+        time.sleep(1.0)
+    decision["sends"] = sends
+    decision["send_errors"] = send_errors[-3:]
+    return decision
+
+
+# How long terminal verification keeps re-sending an ignored pc.bootstrap, and
+# how far apart. A Primary forms within about a second of an accepted send on a
+# quiet network, so 5 s between sends leaves room for that without waiting out
+# a whole state exchange. 90 s covers more than two cycles of a
+# pc.wait_prim_timeout (30 s) restart loop.
+BOOTSTRAP_RETRY_SECONDS = 90.0
+BOOTSTRAP_RESEND_SECONDS = 5.0
+
+
+def _is_primary(st: dict[str, str] | None) -> bool:
+    return bool(st) and st.get("wsrep_cluster_status", "").lower() == "primary"
+
+
+def _send_pc_bootstrap(host: str) -> str | None:
+    """Send pc.bootstrap=YES to ``host``. Returns an error string, or None."""
     conn = db.connect_with_retry(host, attempts=2)
     if conn is None:
-        decision["error"] = db.LAST_ERROR.get(host)
-        return decision
+        return db.LAST_ERROR.get(host) or "connect failed"
     try:
-        # Last look: the sampling above took seconds, and a booting node can
-        # restore a Primary in that gap.
-        if not _no_primary_anywhere(db.cluster_status()):
-            decision["error"] = "a Primary appeared before the bootstrap was sent"
-            return decision
         with conn.cursor() as cur:
             cur.execute("SET GLOBAL wsrep_provider_options = 'pc.bootstrap=YES'")
-        decision["bootstrapped"] = True
+        return None
     except Exception as exc:  # noqa: BLE001
-        decision["error"] = str(exc)[:200]
+        return str(exc)[:200]
     finally:
         db.close_quietly(conn)
-    return decision
 
 
 def wait_commit_cut_equal(deadline: float, poll: float = 2.0) -> tuple[bool, dict[str, int]]:
