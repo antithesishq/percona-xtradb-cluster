@@ -34,6 +34,8 @@ set -uo pipefail
 
 PXC_PREFIX="${PXC_PREFIX:-/usr/local/pxc}"
 DATADIR="${PXC_DATADIR:-/var/lib/mysql}"
+# Must match `socket` in my.cnf; mysqld writes its lock next to it.
+SOCKET_LOCK="${PXC_SOCKET:-${DATADIR}/mysql.sock}.lock"
 LOG_ERROR="${PXC_LOG_ERROR:-/var/log/mysql/error.log}"
 STATE_DIR="${PXC_STATE_DIR:-/opt/antithesis/state}"
 DEFAULTS_FILE="${PXC_DEFAULTS_FILE:-/etc/my.cnf}"
@@ -947,6 +949,28 @@ while :; do
         fi
         emit "boot_mode" "\"mode\":\"join\",\"position\":\"${RECOVERED_POSITION}\""
         log "joining cluster${RECOVERED_POSITION:+ at position ${RECOVERED_POSITION}}"
+    fi
+
+    # Clear a stale unix-socket lock before mysqld starts. The socket lives
+    # in the datadir (my.cnf), so its lock file survives a container kill
+    # with the dead mysqld's PID in it. mysqld trusts that PID if any live
+    # process holds it, and the new container's PIDs start low again, so a
+    # child of the new mysqld (the SST joiner script) can get the same
+    # number. mysqld then aborts with MY-010259 "Another process with pid N
+    # is using unix socket file": run 1ef68127-63-5 filed these as a
+    # MY-010268 unireg_abort and a "View callback failed" gu_abort, both
+    # caused by the harness. Every lock here is stale: this supervisor
+    # starts the only mysqld in the container and has already waited for
+    # the last one to exit.
+    #
+    # Deliberate divergence from the field: a host keeps one PID space
+    # across a mysqld crash, so PID reuse is much rarer there, and systemd
+    # does not clean the lock either.
+    # TODO: report a stale lock as a coverage claim if the field case ever
+    # matters to Percona.
+    if [[ -f "${SOCKET_LOCK}" ]]; then
+        emit "stale_socket_lock_removed" "\"stale_pid\":\"$(tr -dc '0-9' < "${SOCKET_LOCK}" 2>/dev/null)\""
+        rm -f "${SOCKET_LOCK}"
     fi
 
     emit "mysqld_exec"
