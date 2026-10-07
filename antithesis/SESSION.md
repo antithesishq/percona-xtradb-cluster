@@ -41,4 +41,4 @@ Deferred issues found during triage. Fix later unless they block work.
 
 ## Found 2026-10-07
 
-- **`oracle-tests/test_start_position.py` fails 3 cases in this sandbox, with or without the working-tree changes:** `seqno -1 falls through to --wsrep-recover`, `missing grastate falls through to --wsrep-recover`, `detection: old behaviour starts at the recovered 603`. Each one logs `recover_no_position` and `recover_ran: False`, so the stubbed `--wsrep-recover` never runs. Check if the stub needs a binary that the sandbox does not have before you trust `local-validate.sh --offline` here.
+- **`oracle-tests/test_start_position.py` failed 3 cases in another session's sandbox** (the two fall-through cases and the old-behaviour detection). The test passes on the exe.dev VM with the default `/tmp` and with a Claude scratchpad as `TMPDIR`. A fake `mysqld` without exec permission gives exactly these 3 failures, so a temp directory that does not allow exec is the likely cause, but this is not proven for that sandbox. The failure details now include `recover_stdio`, so the next failure shows the cause.

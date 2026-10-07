@@ -75,8 +75,13 @@ echo "POS=${{RECOVERED_POSITION}}"
 """
         out = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
         pos = [l[4:] for l in out.stdout.splitlines() if l.startswith("POS=")]
+        # recover_position sends the fake mysqld's stdout/stderr here. If the
+        # fake never ran (recover_ran False), this file says why, for
+        # example a temp directory that does not allow exec.
+        stdio = state / "wsrep-recover.stdio"
         return {
             "pos": pos[0] if pos else None,
+            "recover_stdio": stdio.read_text() if stdio.exists() else None,
             "recover_ran": ran.exists(),
             "left": sorted(p.name for p in datadir.iterdir()),
             "events": events.read_text().split() if events.exists() else [],
