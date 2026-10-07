@@ -41,4 +41,22 @@ Deferred issues found during triage. Fix later unless they block work.
 ## Found 2026-10-07
 
 - **`oracle-tests/test_start_position.py` failed 3 cases in another session's sandbox** (the two fall-through cases and the old-behaviour detection). The test passes on the exe.dev VM with the default `/tmp` and with a Claude scratchpad as `TMPDIR`. A fake `mysqld` without exec permission gives exactly these 3 failures, so a temp directory that does not allow exec is the likely cause, but this is not proven for that sandbox. The failure details now include `recover_stdio`, so the next failure shows the cause.
+
+## From the Percona summary of runs fdb9d32c…-63-5 and b1e4971e…-63-5 (2026-10-07)
+
+- **The 12h run fdb9d32c…-63-5 filled the VM disk at about vtime 212.** Cause found 2026-10-07 (input_hash -428787273264483603):
+  - Each node created about 52 gcache pages of 32 MB between 01:46:09 and 01:46:37 and deleted 3. That is about 1.6 GB per node, 4.8 GB for the cluster. The last page request found 8,359,936 bytes free.
+  - `bulk_write` (`workload/pxcwl/ops.py:497`) runs `REPLACE` on an existing row, so the writeset is an `Update_rows` event with the full before and after image. The failed action was 16,777,592 bytes (2 × 8 MiB). That is larger than the 16 MB gcache ring, which `BULK_MAX_BYTES` (`config.py:107`) is meant to prevent.
+  - Galera deletes pages only from the oldest end (`gcache_page_store.cpp:145-152`). node1 freed 48 pages at once when it went Inconsistent at 01:46:37.35, so writesets that the node had not released pinned the pages. Inferred, not proven: the receive queue (flow-control limit 173 writesets) and slow appliers (InnoDB redo-log stall warnings `MY-014084` at 01:46:15 and 01:46:28) held them.
+  - Binlogs are not the cause here: below 0.5 MB per node.
+  - Not explained: at vtime 168 the workload filesystem had 7.58 GB free of 8.39 GB. gcache explains about 4.8 GB. The other ~2.8 GB is not measured, and it is not proven that the workload filesystem is the same pool as the nodes' disk.
+- **No property catches a 1-of-3 Primary after an identity change** (run b1e4971e…-63-5, input_hash 7386397666427349546). The single-primary oracle needs two Primaries. Add a log scan that fails when a PRIM view keeps less than half of the previous PRIM members and the rest are "partitioned", not "left".
+- **Terminal verification does not restart a live node that stays Inconsistent**, so that history always fails reconvergence.
+- **The gu_abort cause key is the last `[ERROR]` line, not the first fatal one.** One root cause splits into several properties (`STATE EXCHANGE`, `MY-013132`, `failed to close gcomm`).
+- **A crash with two failed asserts records only the first site** (12h vtime 120.00: `transaction_info.h:472` and `client_state.cpp:438`).
+- **The supervisor replays earlier boots' error-log lines at the new boot's vtime.** A timeline built only by vtime is wrong. Use the mysqld timestamps.
+- **`trx0trx.cc:2534` has no backtrace in either run**, so its owner is not known. Put the error-log `#N` frames into the death details, or get them with antithesis-debug at 2h input_hash -7265113343034222745, vtime 217.09.
+- **Data-oracle details carry no resolve vtime, Galera seqno or trx id**, so a `wid` cannot be mapped to its commit moment. The journal calls the op `txn_witness`, but the `pxc_op` event calls it `txn_multi_statement`.
+- **`snouty runs events` returns only the first 1000 events by vtime, with no paging**, so end-of-run failures (about vtime 683) cannot be sampled. It returns HTTP 500 on run fdb9d32c…-63-5.
+- **Deaths that mysqld catches show `kind:"exit"` with `status:2`**, which looks like a clean exit. Use a kind such as `caught_signal`.
 - **node2 failed to apply a rollback fragment of its own transaction, then left the cluster** (run fdb9d32c…-63-5, input_hash 7856742902588311048, `01:45:30.217Z`): `Failed to apply write set … flags: 20 (rollback | pa_unsafe)`, with node2's own UUID as source. No InnoDB error comes first. Check if this belongs with the T3 SR-rollback finding (`wsrep-lib/src/transaction.cpp:374`).
