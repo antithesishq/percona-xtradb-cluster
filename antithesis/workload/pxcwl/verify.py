@@ -110,6 +110,20 @@ def _run(mode: str) -> int:
         # Does the cluster come back at all?
         oracles.cluster_reconverged(all_synced, base)
 
+        # Plain stdout, not an SDK event: `snouty runs events` searches log
+        # text but not custom events or assertion details, so this line is
+        # the only way to count, across a run, the reds where no node answered
+        # SQL at the final poll. bootstrap_if_no_primary cannot act on those,
+        # and the one in run fdb9d32c...-63-5 (vtime 682) was Galera waiting
+        # for an operator, not a PXC defect. Keep the text stable; triage
+        # greps it. `states` is empty when the deadline passed before any
+        # poll, which says nothing about the nodes.
+        if states and not any(states.values()):
+            print(
+                f"[verify] reconvergence: no node answers SQL (mode={mode})",
+                flush=True,
+            )
+
         # Did it come back as ONE cluster? Deliberately a separate property:
         # split-brain and never-recovered are different bugs, and collapsing
         # them would make a triage report ambiguous about which happened.
