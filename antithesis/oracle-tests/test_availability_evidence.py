@@ -201,6 +201,12 @@ def drive(outcomes, *, maint="DISABLED", ticks=25, preseed=None, before=None, af
         return None if seq[i] is None else dict(seq[i])
 
     db.cluster_status = lambda: {"node1": nth(before, "before")}
+    # The probe loop reads through cluster_status_sampled(); the read time is
+    # not under test here, so every answered read gets the fake clock's time.
+    def sampled():
+        st = nth(before, "before")
+        return {"node1": st}, ({} if st is None else {"node1": clock.t})
+    db.cluster_status_sampled = sampled
     db.node_status = lambda host: nth(after, "after")
     db.connect_with_retry = lambda *a, **k: FakeConn()
     db.close_quietly = lambda c: None

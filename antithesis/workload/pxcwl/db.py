@@ -11,6 +11,7 @@ when the real cause was a missing Python package (entrypoint.py:105-111).
 from __future__ import annotations
 
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pymysql
 
@@ -327,6 +328,38 @@ def is_synced(state: dict[str, str] | None) -> bool:
 
 def cluster_status() -> dict[str, dict[str, str] | None]:
     return {name: node_status(host) for name, host in config.NODES}
+
+
+def cluster_status_sampled(
+    nodes: list[tuple[str, str]] | None = None,
+) -> tuple[dict[str, dict[str, str] | None], dict[str, float]]:
+    """wsrep status of every node, read at the same time, with each read's time.
+
+    cluster_status() reads the nodes one after another, so one node's 5 s
+    connect timeout puts the next node's read 5 s later. Run 69449aa5-63-5
+    (vtime 212.50) compared two such reads and saw two one-member Primary
+    views that never existed at the same moment. Here every node is read in
+    its own thread, so a slow node delays only its own sample.
+
+    sampled_at holds time.time() when a node's read returned, and only for
+    nodes that answered. The caller decides which reads are close enough to
+    compare. `nodes` limits the read to some nodes; the default is all of them.
+    """
+    nodes = config.NODES if nodes is None else nodes
+
+    def read(item):
+        name, host = item
+        st = node_status(host)
+        return name, st, time.time()
+
+    states: dict[str, dict[str, str] | None] = {}
+    sampled_at: dict[str, float] = {}
+    with ThreadPoolExecutor(max_workers=len(nodes)) as pool:
+        for name, st, at in pool.map(read, nodes):
+            states[name] = st
+            if st is not None:
+                sampled_at[name] = at
+    return states, sampled_at
 
 
 def clustercheck_green(state: dict[str, str] | None, maint_mode: str | None) -> bool:

@@ -24,7 +24,6 @@ Deferred issues found during triage. Fix later unless they block work.
 
 ## From run 69449aa58ca0c6eb951ad94a09d897a2-63-5 (12h, images @ d902550b0, 2026-10-06)
 
-- **Split-brain false positive.** `single_primary_component` (`workload/pxcwl/probe.py:282-322`) reads the nodes in sequence and records no time per sample. One 5 s connect timeout to a down node let two non-overlapping one-member views look like two Primaries (vtime 212.50). Add `sampled_at` per node, and compare only samples within a short window. Skip nodes in `pxc_maint_mode=SHUTDOWN`.
 - **Stale socket lock deaths are in this run.** The images predate `86e244a08`. Do not count `MY-010119 [Server]` / `MY-010268 [Server]` deaths, or the `View callback failed` deaths that follow MY-010259.
 - **gu_abort property names keep the node UUID.** "failed to close gcomm backend connection: element X not found" splits one cause into 5 properties. Normalize the UUID.
 - **Crash dumps arrive late or get lost.** `tail -F` (`entrypoint.sh:907`) copies the error log with a delay. The dump lands after the counterexample moment, and it is lost if the container stops at once (signal 6 deaths had no frames). Fetch with `snouty runs logs` and no vtime to stream to the end of the branch, or flush the error log before the supervisor exits.
@@ -42,3 +41,4 @@ Deferred issues found during triage. Fix later unless they block work.
 ## Found 2026-10-07
 
 - **`oracle-tests/test_start_position.py` failed 3 cases in another session's sandbox** (the two fall-through cases and the old-behaviour detection). The test passes on the exe.dev VM with the default `/tmp` and with a Claude scratchpad as `TMPDIR`. A fake `mysqld` without exec permission gives exactly these 3 failures, so a temp directory that does not allow exec is the likely cause, but this is not proven for that sandbox. The failure details now include `recover_stdio`, so the next failure shows the cause.
+- **node2 failed to apply a rollback fragment of its own transaction, then left the cluster** (run fdb9d32c…-63-5, input_hash 7856742902588311048, `01:45:30.217Z`): `Failed to apply write set … flags: 20 (rollback | pa_unsafe)`, with node2's own UUID as source. No InnoDB error comes first. Check if this belongs with the T3 SR-rollback finding (`wsrep-lib/src/transaction.cpp:374`).

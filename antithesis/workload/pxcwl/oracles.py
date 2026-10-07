@@ -175,6 +175,19 @@ def single_primary_component(ok: bool, details: Details) -> None:
     always(ok, "[prod] at most one primary component exists at any observation", details)
 
 
+def saw_torn_primary_read(details: Details) -> None:
+    """A disjoint Primary pair went away on a re-read 0.5 s later.
+
+    "outcome" is "overlapping" (both Primary, now sharing a member) or
+    "left_primary" (one node answered and is no longer Primary).
+
+    Seen in run fdb9d32c-63-5 (vtime 146.11): a leaving node had already set
+    its member list to itself, but still reported Primary. This claim counts
+    how often the re-read in probe._confirmed_split_brain clears a pair.
+    """
+    reachable("[coverage] a disjoint Primary pair was not seen again on a re-read", details)
+
+
 def green_node_can_commit(ok: bool, details: Details) -> None:
     """The health surface must tell the truth.
 

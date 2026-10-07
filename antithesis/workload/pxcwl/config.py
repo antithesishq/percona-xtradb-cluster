@@ -56,6 +56,17 @@ LEVERS_ENABLED = os.environ.get("PXC_LEVERS", "on").strip().lower() not in (
 TRAFFIC_WALL_BUDGET_SECONDS = float(os.environ.get("PXC_TRAFFIC_BUDGET", "100"))
 PROBE_WALL_BUDGET_SECONDS = float(os.environ.get("PXC_PROBE_BUDGET", "90"))
 PROBE_INTERVAL_SECONDS = float(os.environ.get("PXC_PROBE_INTERVAL", "3"))
+# Two Primary claims count as simultaneous only when their status reads
+# returned within this many seconds of each other. A healthy read takes
+# milliseconds, and a slow connect can take up to CONNECT_TIMEOUT_SECONDS, so
+# 1 s keeps the real pairs and drops the ones that one slow node pulled apart.
+PRIMARY_SAMPLE_WINDOW_SECONDS = float(os.environ.get("PXC_PRIMARY_SAMPLE_WINDOW", "1"))
+# A disjoint Primary pair is read again after this delay, and fails only if
+# it is still disjoint. Galera sets wsrep_incoming_addresses before
+# wsrep_cluster_status on a leave, about 20 ms apart in run fdb9d32c-63-5, so
+# 0.5 s is well past that gap and far shorter than any split brain that
+# matters to a client.
+PRIMARY_CONFIRM_DELAY_SECONDS = float(os.environ.get("PXC_PRIMARY_CONFIRM_DELAY", "0.5"))
 # Scan a live node's error log every Nth probe iteration, not every one: five
 # LIKE queries per node per pass is real load, and performance_schema.error_log
 # is a ring buffer that holds an event for far longer than one interval.

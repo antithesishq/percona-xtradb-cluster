@@ -263,6 +263,126 @@ def _disk_sample() -> None:
     )
 
 
+def _split_brain(
+    states: dict[str, dict[str, str] | None],
+    sampled_at: dict[str, float],
+    window: float,
+) -> dict:
+    """Find two nodes that claim disjoint Primary components at the same time.
+
+    Two nodes that each claim Primary must agree on at least one member.
+    Disjoint Primary views are split brain. Comparing member sets rather than
+    counts tolerates a view change that one node has seen and the other not.
+
+    A pair counts only when both reads returned within `window` seconds of
+    each other. Two reads further apart do not show that both views existed
+    at once (run 69449aa5-63-5, vtime 212.50), so they give no verdict. The
+    reads come from db.cluster_status_sampled(), which reads all nodes at
+    once, so a lasting split brain is still compared on every iteration.
+
+    The Primary test is still wsrep_cluster_status alone. A node can be
+    Primary while it is a Donor or Joined, and a split brain often starts a
+    state transfer, so a stricter test would hide real cases.
+    """
+    primary_sets: dict[str, set[str]] = {}
+    for name, st in states.items():
+        if st is None or name not in sampled_at:
+            continue
+        if st.get("wsrep_cluster_status", "").lower() == "primary":
+            addrs = {
+                a.strip()
+                for a in (st.get("wsrep_incoming_addresses") or "").split(",")
+                if a.strip()
+            }
+            if addrs:
+                primary_sets[name] = addrs
+
+    compared = 0
+    skipped_skew = []
+    disjoint = None
+    names = sorted(primary_sets)
+    for i in range(len(names)):
+        for j in range(i + 1, len(names)):
+            a, b = names[i], names[j]
+            skew = abs(sampled_at[a] - sampled_at[b])
+            if skew > window:
+                skipped_skew.append({"pair": [a, b], "skew_s": round(skew, 3)})
+                continue
+            compared += 1
+            if not (primary_sets[a] & primary_sets[b]):
+                disjoint = (a, b)
+
+    first = min(sampled_at.values()) if sampled_at else 0.0
+    return {
+        "primary_views": {k: sorted(v) for k, v in primary_sets.items()},
+        "disjoint_pair": disjoint,
+        "compared_pairs": compared,
+        "skipped_for_skew": skipped_skew,
+        # Offsets from the earliest read, so the gap between reads is plain.
+        "sampled_at_offset_s": {k: round(v - first, 3) for k, v in sorted(sampled_at.items())},
+        "window_s": window,
+    }
+
+
+def _confirmed_split_brain(
+    states: dict[str, dict[str, str] | None],
+    sampled_at: dict[str, float],
+) -> dict:
+    """_split_brain, with a re-read of a disjoint pair before it counts.
+
+    One status read is not atomic. On a leave, Galera sets
+    wsrep_incoming_addresses to the new view first
+    (galera/src/replicator_smm.cpp:2756, update_incoming_list) and only then
+    runs the view callback that sets wsrep_cluster_status to non-Primary
+    (sql/wsrep_server_service.cc:387). In run fdb9d32c-63-5 (vtime 146.11)
+    node2 was read in that 20 ms gap: "Primary", members {node2}, while node3
+    was the real one-member Primary. Galera never had two Primary components.
+
+    So a disjoint pair is read again after PRIMARY_CONFIRM_DELAY_SECONDS, and
+    the verdict is the re-read's. A real split brain lasts, so it shows again.
+    The first read stays in the details as first_read either way.
+    """
+    first = _split_brain(states, sampled_at, config.PRIMARY_SAMPLE_WINDOW_SECONDS)
+    if first["disjoint_pair"] is None:
+        return first
+
+    pair = set(first["disjoint_pair"])
+    time.sleep(config.PRIMARY_CONFIRM_DELAY_SECONDS)
+    again_states, again_at = db.cluster_status_sampled(
+        [(n, h) for n, h in config.NODES if n in pair]
+    )
+    again = _split_brain(again_states, again_at, config.PRIMARY_SAMPLE_WINDOW_SECONDS)
+
+    # Four outcomes of the re-read:
+    #   both still Primary, still disjoint -> the verdict fails (split brain)
+    #   both still Primary, now overlapping -> pass; the first read was torn
+    #   a node answered and is not Primary  -> no verdict; it left, as in
+    #                                          run fdb9d32c-63-5 vtime 146.11
+    #   a node did not answer               -> no verdict
+    #   the two reads were too far apart     -> no verdict
+    # "No verdict" is not a pass. A split brain that ended inside the 0.5 s
+    # delay looks the same as a torn read, so neither outcome may count as
+    # evidence that there was no split brain.
+    if again["disjoint_pair"] is not None:
+        return {**again, "first_read": first}
+    if again["compared_pairs"]:
+        outcome = "overlapping"
+    elif len(again_at) < len(pair):
+        outcome = "unreachable"
+    elif again["skipped_for_skew"]:
+        # Both still Primary, but the reads were too far apart to compare.
+        outcome = "skewed"
+    else:
+        outcome = "left_primary"
+    if outcome in ("overlapping", "left_primary"):
+        oracles.saw_torn_primary_read({"outcome": outcome, "first_read": first, "re_read": again})
+    if outcome == "overlapping":
+        return {**again, "first_read": first}
+    # TODO: the re-read covers only the pair. A third node's claim is not
+    # read again, which matters only if all three nodes claim Primary alone.
+    return {**again, "compared_pairs": 0, "re_read_outcome": outcome, "first_read": first}
+
+
 def _run() -> int:
     jr = journal.Journal("probe")
     try:
@@ -278,48 +398,24 @@ def _run() -> int:
             now = time.time()
             iteration += 1
             scan_logs = iteration % config.ERROR_LOG_SCAN_EVERY == 1
-            states = db.cluster_status()
+            states, sampled_at = db.cluster_status_sampled()
 
             # ---------------------------------------------------- membership
-            primary_sets: dict[str, set[str]] = {}
-            for name, st in states.items():
+            for st in states.values():
                 if st is None:
                     continue
-                if st.get("wsrep_cluster_status", "").lower() == "primary":
-                    addrs = {
-                        a.strip()
-                        for a in (st.get("wsrep_incoming_addresses") or "").split(",")
-                        if a.strip()
-                    }
-                    if addrs:
-                        primary_sets[name] = addrs
                 try:
                     if int(st.get("wsrep_cluster_size", "3") or 3) < config.EXPECTED_CLUSTER_SIZE:
                         saw_small_cluster = True
                 except ValueError:
                     pass
 
-            # Two nodes each claiming Primary must at least agree on some
-            # member. Disjoint primary views are split brain. Comparing
-            # membership sets rather than counts is what makes this tolerant of
-            # poll skew instead of flaky.
-            disjoint = None
-            names = sorted(primary_sets)
-            for i in range(len(names)):
-                for j in range(i + 1, len(names)):
-                    if not (primary_sets[names[i]] & primary_sets[names[j]]):
-                        disjoint = (names[i], names[j])
-            # Needs at least two nodes claiming Primary to mean anything: with
-            # fewer, there is no pair to be disjoint and evaluating the
-            # assertion would just add passing noise to the report.
-            if len(names) >= 2:
-                oracles.single_primary_component(
-                    disjoint is None,
-                    {
-                        "primary_views": {k: sorted(v) for k, v in primary_sets.items()},
-                        "disjoint_pair": disjoint,
-                    },
-                )
+            verdict = _confirmed_split_brain(states, sampled_at)
+            # Needs at least one pair of simultaneous Primary claims to mean
+            # anything: with none, there is no pair to be disjoint and
+            # evaluating the assertion would just add passing noise.
+            if verdict["compared_pairs"]:
+                oracles.single_primary_component(verdict["disjoint_pair"] is None, verdict)
 
             for name, host in config.NODES:
                 st = states.get(name)
